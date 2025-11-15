@@ -1,0 +1,33 @@
+# Flutter
+FlutterAPP/build/
+FlutterAPP/.dart_tool/
+FlutterAPP/.idea/
+FlutterAPP/.packages
+FlutterAPP/pubspec.lock
+
+# Rust
+RustServer/target/
+
+# Tauri Node dependencies
+TauriAPP/node_modules/
+TauriAPP/.vite/
+TauriAPP/.tauri/
+
+# Tauri Rust target
+TauriAPP/src-tauri/target/
+
+# VSCode
+.vscode/
+
+# Windows binaries
+Win32APP/*.exe
+Win32APP/*.obj
+Win32APP/*.pdb
+Win32APP/*.ilk
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini

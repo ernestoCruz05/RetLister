@@ -1,4 +1,54 @@
-# Flutter
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node / Tauri (frontend)
+TauriAPP/node_modules/
+TauriAPP/dist/
+TauriAPP/.vite/
+TauriAPP/.tauri/
+
+# Rust (all crates)
+**/target/
+
+# Flutter / Dart (all apps)
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/.metadata
+**/Pods/
+**/Flutter/Generated*.*
+**/Flutter/ephemeral/
+**/.gradle/
+**/local.properties
+
+# Win32 native build artifacts
+Win32APP/*.obj
+Win32APP/*.pdb
+Win32APP/*.ilk
+Win32APP/*.map
+Win32APP/*.res
+Win32APP/*.idb
+Win32APP/*.exe
+Win32APP/*.dll
+
+# Misc caches / temps
+*.tmp
+*.cache# Flutter
 FlutterAPP/build/
 FlutterAPP/.dart_tool/
 FlutterAPP/.idea/

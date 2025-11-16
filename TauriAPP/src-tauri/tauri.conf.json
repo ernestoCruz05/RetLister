@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "stocklister",
+  "productName": "RetLister",
   "version": "0.1.0",
   "identifier": "com.fakyc.stocklister",
   "build": {
@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "stocklister",
-        "width": 800,
-        "height": 600
+        "title": "RetLister",
+        "width": 1024,
+        "height": 700
       }
     ],
     "security": {

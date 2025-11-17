@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -9,15 +9,98 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, Pool, Sqlite};
 use std::net::SocketAddr;
 use std::fs;
+use std::time::Duration;
 use time::OffsetDateTime;
+use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
+use tower_http::LatencyUnit;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // TODO: Big consideration, but maybe add cut grain direction later.
 
+// Validation constants
+const MIN_DIMENSION: i64 = 1;
+const MAX_DIMENSION: i64 = 10000;
+const MAX_THICKNESS: i64 = 1000;
+const MIN_MATERIAL_LEN: usize = 1;
+const MAX_MATERIAL_LEN: usize = 64;
+const MAX_NOTES_LEN: usize = 256;
+
 #[derive(Clone)]
 struct AppState {
     db: Pool<Sqlite>,
+}
+
+// Custom error type with JSON response
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+}
+
+enum AppError {
+    Validation(String),
+    NotFound(String),
+    Database(sqlx::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, error, details) = match self {
+            AppError::Validation(msg) => {
+                tracing::warn!(error = %msg, "Validation error");
+                (StatusCode::BAD_REQUEST, "Validation error".to_string(), Some(msg))
+            },
+            AppError::NotFound(msg) => {
+                tracing::debug!(error = %msg, "Resource not found");
+                (StatusCode::NOT_FOUND, "Not found".to_string(), Some(msg))
+            },
+            AppError::Database(err) => {
+                tracing::error!("Database error: {}", err);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string(), None)
+            }
+        };
+        
+        let body = Json(ErrorResponse { error, details });
+        (status, body).into_response()
+    }
+}
+
+// Validation helpers
+fn validate_dimensions(width: i64, height: i64, thickness: i64) -> Result<(), AppError> {
+    if width < MIN_DIMENSION || width > MAX_DIMENSION {
+        return Err(AppError::Validation(format!("Width must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+    }
+    if height < MIN_DIMENSION || height > MAX_DIMENSION {
+        return Err(AppError::Validation(format!("Height must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+    }
+    if thickness < MIN_DIMENSION || thickness > MAX_THICKNESS {
+        return Err(AppError::Validation(format!("Thickness must be between {} and {} mm", MIN_DIMENSION, MAX_THICKNESS)));
+    }
+    Ok(())
+}
+
+fn validate_material(material: &str) -> Result<(), AppError> {
+    let len = material.len();
+    if len < MIN_MATERIAL_LEN || len > MAX_MATERIAL_LEN {
+        return Err(AppError::Validation(format!("Material must be between {} and {} characters", MIN_MATERIAL_LEN, MAX_MATERIAL_LEN)));
+    }
+    if material.trim().is_empty() {
+        return Err(AppError::Validation("Material cannot be empty or whitespace only".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_notes(notes: &Option<String>) -> Result<(), AppError> {
+    if let Some(n) = notes {
+        if n.len() > MAX_NOTES_LEN {
+            return Err(AppError::Validation(format!("Notes must not exceed {} characters", MAX_NOTES_LEN)));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, FromRow)]
@@ -95,20 +178,30 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = fs::create_dir_all("data");
 
+    let db_path = std::env::current_dir()?.join("data").join("retlister.db");
+    let connection_string = format!("sqlite://{}", db_path.display());
+    
+    tracing::info!("Connecting to database: {}", connection_string);
+
     let db = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect("sqlite://data/retlister.db")
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&connection_string)
         .await?;
 
-    let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&db).await;
-    let _ = sqlx::query("PRAGMA foreign_keys=ON;").execute(&db).await;
+    // Configure SQLite for safety and performance
+    sqlx::query("PRAGMA journal_mode=WAL;").execute(&db).await?;
+    sqlx::query("PRAGMA foreign_keys=ON;").execute(&db).await?;
+    sqlx::query("PRAGMA busy_timeout=5000;").execute(&db).await?; // 5 second timeout for locks
 
-    sqlx::migrate!().run(&db).await?;
+    sqlx::migrate!("./Migrations").run(&db).await?;
 
     let state = AppState { db };
 
     // Leftover <=> Resto
     let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
         .route("/add", post(add_resto))
         .route("/remove/:id", delete(remove_resto))
         .route("/update/:id", post(update_resto))
@@ -117,10 +210,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/stats", get(get_stats))
         .with_state(state)
         .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
+            ServiceBuilder::new()
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                        .on_response(DefaultOnResponse::new().level(tracing::Level::INFO).latency_unit(LatencyUnit::Millis))
+                )
+                .layer(TimeoutLayer::new(Duration::from_secs(30))) // 30s request timeout
+                .layer(
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods(Any)
+                        .allow_headers(Any),
+                )
         );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
@@ -133,20 +235,11 @@ async fn main() -> anyhow::Result<()> {
 async fn add_resto(
     State(state): State<AppState>,
     Json(payload): Json<AddLeftoverRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if payload.width_mm <= 0
-        || payload.height_mm <= 0
-        || payload.thickness_mm <= 0
-        || payload.material.is_empty()
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid input, check:
- > Dimensions must be positive numbers
- > Material must not be empty"
-                .into(),
-        ));
-    }
+) -> Result<impl IntoResponse, AppError> {
+    // Comprehensive validation
+    validate_dimensions(payload.width_mm, payload.height_mm, payload.thickness_mm)?;
+    validate_material(&payload.material)?;
+    validate_notes(&payload.notes)?;
 
     let created_at = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -166,9 +259,18 @@ async fn add_resto(
     .bind(created_at)
     .execute(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
 
     let id = result.last_insert_rowid();
+    
+    tracing::info!(
+        id = id,
+        width = payload.width_mm,
+        height = payload.height_mm,
+        thickness = payload.thickness_mm,
+        material = %payload.material,
+        "Added new resto"
+    );
 
     Ok((StatusCode::CREATED, Json(AddLeftoverResponse { id })))
 }
@@ -176,17 +278,19 @@ async fn add_resto(
 async fn remove_resto(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, AppError> {
     let res = sqlx::query("DELETE FROM leftovers WHERE id = ?1")
         .bind(id)
         .execute(&state.db)
         .await
-        .map_err(internal_error)?;
+        .map_err(AppError::Database)?;
 
     if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, format!("No resto with id {id}")));
+        tracing::warn!(id = id, "Attempted to remove non-existent resto");
+        return Err(AppError::NotFound(format!("No resto with id {}", id)));
     }
 
+    tracing::info!(id = id, "Removed resto");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -202,20 +306,10 @@ async fn remove_resto(
 async fn search_resto(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if params.width_mm <= 0
-        || params.height_mm <= 0
-        || params.thickness_mm <= 0
-        || params.material.is_empty()
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid search parameters, check:
- > Dimensions must be positive numbers
- > Material must not be empty"
-                .into(),
-        ));
-    }
+) -> Result<impl IntoResponse, AppError> {
+    // Validate search parameters
+    validate_dimensions(params.width_mm, params.height_mm, params.thickness_mm)?;
+    validate_material(&params.material)?;
 
     let required_area = params.width_mm * params.height_mm;
 
@@ -235,10 +329,19 @@ async fn search_resto(
     .bind(&params.material)
     .fetch_all(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
+
+    tracing::debug!(
+        width = params.width_mm,
+        height = params.height_mm,
+        thickness = params.thickness_mm,
+        material = %params.material,
+        candidates = candidates.len(),
+        "Search executed"
+    );
 
     if candidates.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "No matching restos found".into()));
+        return Err(AppError::NotFound(format!("No matching restos found for material '{}' with dimensions {}x{}x{} mm", params.material, params.width_mm, params.height_mm, params.thickness_mm)));
     }
 
     let best_match = candidates
@@ -249,12 +352,19 @@ async fn search_resto(
         })
         .unwrap();
 
+    tracing::info!(
+        search_dimensions = format!("{}x{}x{}", params.width_mm, params.height_mm, params.thickness_mm),
+        match_id = best_match.id,
+        match_dimensions = format!("{}x{}x{}", best_match.width_mm, best_match.height_mm, best_match.thickness_mm),
+        "Found best match"
+    );
+
     Ok(Json(best_match))
 }
 
 async fn list_restos(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, AppError> {
     let restos: Vec<Leftover> = sqlx::query_as(
         r#"
         SELECT id, width_mm, height_mm, thickness_mm, material, notes, created_at
@@ -264,8 +374,9 @@ async fn list_restos(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
 
+    tracing::debug!(count = restos.len(), "Listed restos");
     Ok(Json(restos))
 }
 
@@ -273,50 +384,29 @@ async fn update_resto(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateLeftoverRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Validate if provided
-    if let Some(w) = payload.width_mm {
-        if w <= 0 {
-            return Err((StatusCode::BAD_REQUEST, "Width must be positive".into()));
-        }
-    }
-    if let Some(h) = payload.height_mm {
-        if h <= 0 {
-            return Err((StatusCode::BAD_REQUEST, "Height must be positive".into()));
-        }
-    }
-    if let Some(t) = payload.thickness_mm {
-        if t <= 0 {
-            return Err((StatusCode::BAD_REQUEST, "Thickness must be positive".into()));
-        }
-    }
-    if let Some(ref m) = payload.material {
-        if m.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "Material cannot be empty".into()));
-        }
-    }
-
-    // Check if exists
+) -> Result<impl IntoResponse, AppError> {
+    // Check if exists first
     let existing: Option<Leftover> = sqlx::query_as(
         "SELECT id, width_mm, height_mm, thickness_mm, material, notes, created_at FROM leftovers WHERE id = ?"
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
 
-    if existing.is_none() {
-        return Err((StatusCode::NOT_FOUND, "Resto not found".into()));
-    }
+    let resto = existing.ok_or_else(|| AppError::NotFound(format!("Resto with id {} not found", id)))?;
 
-    let resto = existing.unwrap();
-
-    // Apply updates
+    // Apply updates with defaults from existing
     let new_width = payload.width_mm.unwrap_or(resto.width_mm);
     let new_height = payload.height_mm.unwrap_or(resto.height_mm);
     let new_thickness = payload.thickness_mm.unwrap_or(resto.thickness_mm);
     let new_material = payload.material.unwrap_or(resto.material);
     let new_notes = payload.notes.or(resto.notes);
+
+    // Validate final values
+    validate_dimensions(new_width, new_height, new_thickness)?;
+    validate_material(&new_material)?;
+    validate_notes(&new_notes)?;
 
     sqlx::query(
         r#"
@@ -333,14 +423,21 @@ async fn update_resto(
     .bind(id)
     .execute(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
+
+    tracing::info!(
+        id = id,
+        dimensions = format!("{}x{}x{}", new_width, new_height, new_thickness),
+        material = %new_material,
+        "Updated resto"
+    );
 
     Ok(StatusCode::OK)
 }
 
 async fn get_stats(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, AppError> {
     // Total count and area
     let total: (i64, i64) = sqlx::query_as(
         r#"
@@ -350,7 +447,7 @@ async fn get_stats(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
 
     let (total_count, total_area_mm2) = total;
 
@@ -365,7 +462,7 @@ async fn get_stats(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
 
     // By thickness
     let by_thickness: Vec<ThicknessStats> = sqlx::query_as(
@@ -378,7 +475,15 @@ async fn get_stats(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(internal_error)?;
+    .map_err(AppError::Database)?;
+
+    tracing::debug!(
+        total_count = total_count,
+        total_area_mm2 = total_area_mm2,
+        material_groups = by_material.len(),
+        thickness_groups = by_thickness.len(),
+        "Retrieved stats"
+    );
 
     Ok(Json(StatsResponse {
         total_count,
@@ -388,7 +493,32 @@ async fn get_stats(
     }))
 }
 
-fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
-    tracing::error!("Internal server error: {err}");
-    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    status: String,
+    database: String,
+}
+
+async fn health_check() -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
+}
+
+async fn readiness_check(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    // Quick DB query to verify connection
+    sqlx::query("SELECT 1")
+        .execute(&state.db)
+        .await
+        .map_err(AppError::Database)?;
+    
+    Ok(Json(ReadinessResponse {
+        status: "ready".to_string(),
+        database: "connected".to_string(),
+    }))
 }

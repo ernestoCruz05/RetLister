@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, getServerUrl, setServerUrl } from "./api";
+import VanVisualization from "./VanVisualization";
 
 function optimizeCuts(cuttingList, inventory, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
@@ -1108,44 +1109,44 @@ function App() {
                 </div>
               </div>
             ) : !loadingPlan ? (
-              <div style={{display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#999'}}>
-                <div style={{textAlign: 'center'}}>
-                  <h2>Visualização 3D</h2>
-                  <p>Adicione itens e clique em "Gerar Plano" para ver a otimização</p>
-                  <p className="small muted">(Three.js isométrico será implementado aqui)</p>
+              <div style={{display: 'flex', flexDirection: 'column', height: '100%'}}>
+                <div style={{padding: '20px', borderBottom: '1px solid #ddd'}}>
+                  <h3>Visualização 3D</h3>
+                  <p className="small muted">Adicione itens e clique em "Gerar Plano" para ver a otimização</p>
+                </div>
+                <div style={{flex: 1}}>
+                  <VanVisualization van={vans.find(v => v.id === selectedVanId)} loadingPlan={null} />
                 </div>
               </div>
             ) : (
-              <div style={{padding: '20px'}}>
-                <div className="panel-header">
-                  <h3>Plano de Carregamento</h3>
-                </div>
-                
-                {/* Stats */}
-                <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginBottom: '20px'}}>
-                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
-                    <div className="small muted">Items</div>
-                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.items.length}</div>
+              <div style={{display: 'flex', flexDirection: 'column', height: '100%'}}>
+                <div style={{padding: '20px', borderBottom: '1px solid #ddd'}}>
+                  <div className="panel-header" style={{marginBottom: '15px'}}>
+                    <h3>Plano de Carregamento</h3>
                   </div>
-                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
-                    <div className="small muted">Peso Total</div>
-                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.total_weight.toFixed(1)} kg</div>
-                  </div>
-                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
-                    <div className="small muted">Utilização</div>
-                    <div style={{fontSize: '20px', fontWeight: 'bold', color: loadingPlan.utilization_percent > 80 ? '#28a745' : loadingPlan.utilization_percent > 50 ? '#ffc107' : '#dc3545'}}>
-                      {loadingPlan.utilization_percent.toFixed(1)}%
+                  
+                  {/* Stats */}
+                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px'}}>
+                    <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                      <div className="small muted">Items</div>
+                      <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.items.length}</div>
+                    </div>
+                    <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                      <div className="small muted">Peso Total</div>
+                      <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.total_weight.toFixed(1)} kg</div>
+                    </div>
+                    <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                      <div className="small muted">Utilização</div>
+                      <div style={{fontSize: '20px', fontWeight: 'bold', color: loadingPlan.utilization_percent > 80 ? '#28a745' : loadingPlan.utilization_percent > 50 ? '#ffc107' : '#dc3545'}}>
+                        {loadingPlan.utilization_percent.toFixed(1)}%
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                {/* 3D Visualization placeholder */}
-                <div style={{background: 'white', border: '1px solid #ddd', borderRadius: '4px', padding: '40px', textAlign: 'center', minHeight: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
-                  <div>
-                    <h3 style={{color: '#999'}}>Visualização 3D</h3>
-                    <p className="small muted">(Three.js isométrico será implementado aqui)</p>
-                    <p className="small muted">Volume usado: {loadingPlan.used_volume.toLocaleString()} mm³ / {loadingPlan.van_volume.toLocaleString()} mm³</p>
-                  </div>
+                {/* 3D Visualization */}
+                <div style={{flex: 1, minHeight: 0}}>
+                  <VanVisualization van={vans.find(v => v.id === selectedVanId)} loadingPlan={loadingPlan} />
                 </div>
               </div>
             )}
@@ -1161,6 +1162,45 @@ function App() {
             <h2>Estado dos Serviços</h2>
             <button className="btn" onClick={fetchEstado}>↻ Atualizar</button>
           </div>
+
+          {/* Configuration Section */}
+          <div className="stat-card" style={{marginBottom: '20px'}}>
+            <h3>Configuração de Conexão</h3>
+            <div style={{marginTop: '15px'}}>
+              <label style={{display: 'block', marginBottom: '8px'}}>
+                <strong>URL do Servidor Principal (IP:Porta)</strong>
+              </label>
+              <div style={{display: 'flex', gap: '10px', alignItems: 'stretch'}}>
+                <input 
+                  type="text" 
+                  value={serverUrlInput} 
+                  onChange={(e) => setServerUrlInput(e.target.value)} 
+                  placeholder="http://192.168.1.10:8000"
+                  style={{flex: 1, padding: '8px', fontSize: '14px', border: '1px solid #ccc', borderRadius: '4px'}}
+                />
+                <button 
+                  className="btn primary" 
+                  onClick={() => {
+                    setServerUrl(serverUrlInput);
+                    alert("URL atualizado! A página será recarregada.");
+                    window.location.reload();
+                  }}
+                  style={{padding: '8px 20px', whiteSpace: 'nowrap'}}
+                >
+                  Salvar
+                </button>
+              </div>
+              <div style={{marginTop: '8px', fontSize: '12px', color: '#666'}}>
+                Exemplo: http://192.168.1.10:8000 (use o IP do servidor)
+              </div>
+            </div>
+            <div style={{marginTop: '15px', padding: '10px', background: '#f5f5f5', borderRadius: '4px', borderLeft: '3px solid #2196F3'}}>
+              <div style={{fontSize: '13px', color: '#333'}}>
+                <strong>URL atual:</strong> <code style={{background: '#e0e0e0', padding: '2px 6px', borderRadius: '3px'}}>{getServerUrl()}</code>
+              </div>
+            </div>
+          </div>
+
           {estadoData.lastCheck && (
             <p className="muted small" style={{marginBottom: '20px'}}>Última verificação: {estadoData.lastCheck}</p>
           )}
@@ -1551,7 +1591,7 @@ function App() {
                 length_mm: Number(formData.get('length_mm')),
                 width_mm: Number(formData.get('width_mm')),
                 height_mm: Number(formData.get('height_mm')),
-                weight_kg: Number(formData.get('weight_kg')) || 0,
+                weight_kg: Number(formData.get('weight_kg')) || 1,
                 fragile: formData.get('fragile') === 'on',
                 rotation_allowed: formData.get('rotation_allowed') === 'on',
                 stackable: formData.get('stackable') === 'on',
@@ -1612,6 +1652,7 @@ function App() {
                     type="number" 
                     name="weight_kg" 
                     defaultValue={editingCargo?.weight_kg || ''} 
+                    required
                     min="0.1" 
                     max="500" 
                     step="0.1" 

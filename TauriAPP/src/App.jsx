@@ -1,12 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { addResto, listRestos, removeResto, searchResto, updateResto, getStats } from "./api";
+import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, getServerUrl, setServerUrl } from "./api";
 
-// Guillotine bin packing algorithm with kerf and minimum remainder constraints
 function optimizeCuts(cuttingList, inventory, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
   
-  // Expand cutting list with quantities
   const allCuts = [];
   cuttingList.forEach(cut => {
     for (let i = 0; i < cut.quantity; i++) {
@@ -14,7 +12,6 @@ function optimizeCuts(cuttingList, inventory, settings) {
     }
   });
   
-  // Try multiple strategies and pick the best
   const strategies = [
     { sortBy: 'area-desc', label: 'Largest area first' },
     { sortBy: 'width-desc', label: 'Widest first' },
@@ -39,7 +36,6 @@ function optimizeCuts(cuttingList, inventory, settings) {
 }
 
 function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, minRemainderHeight, sortBy) {
-  // Sort cuts based on strategy
   const sortedCuts = [...allCuts].sort((a, b) => {
     if (sortBy === 'area-desc') return (b.width_mm * b.height_mm) - (a.width_mm * a.height_mm);
     if (sortBy === 'width-desc') return b.width_mm - a.width_mm;
@@ -51,28 +47,23 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
   const usedPlanks = [];
   const unplacedCuts = [];
   
-  // Available planks sorted by area (use smaller first)
   const availablePlanks = inventory
     .map(resto => ({ resto, freeRects: [{ x: 0, y: 0, width: resto.width_mm, height: resto.height_mm }] }))
     .sort((a, b) => (a.resto.width_mm * a.resto.height_mm) - (b.resto.width_mm * b.resto.height_mm));
   
-  // Try to place each cut
   for (const cut of sortedCuts) {
     let placed = false;
     
-    // Find compatible plank
     for (const plank of availablePlanks) {
       if (plank.resto.material.toLowerCase() !== cut.material.toLowerCase()) continue;
       if (plank.resto.thickness_mm !== cut.thickness_mm) continue;
       
-      // Try both orientations
       const orientations = [
         { w: cut.width_mm, h: cut.height_mm, rotated: false },
         { w: cut.height_mm, h: cut.width_mm, rotated: true }
       ];
       
       for (const orient of orientations) {
-        // Find best free rectangle using Guillotine split
         let bestRect = null;
         let bestRectIndex = -1;
         let bestWaste = Infinity;
@@ -90,7 +81,6 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
         }
         
         if (bestRect) {
-          // Place the cut
           const placedCut = {
             ...cut,
             x: bestRect.x,
@@ -103,10 +93,8 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
           if (!plank.cuts) plank.cuts = [];
           plank.cuts.push(placedCut);
           
-          // Remove used rectangle and create new free rectangles with Guillotine split
           plank.freeRects.splice(bestRectIndex, 1);
           
-          // Horizontal split
           const rightRect = {
             x: bestRect.x + orient.w + kerfWidth,
             y: bestRect.y,
@@ -114,7 +102,6 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
             height: orient.h
           };
           
-          // Vertical split
           const bottomRect = {
             x: bestRect.x,
             y: bestRect.y + orient.h + kerfWidth,
@@ -122,7 +109,6 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
             height: bestRect.height - orient.h - kerfWidth
           };
           
-          // Only add rectangles that meet minimum size
           if (rightRect.width >= minRemainderWidth && rightRect.height >= minRemainderHeight) {
             plank.freeRects.push(rightRect);
           }
@@ -143,7 +129,6 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
     }
   }
   
-  // Filter planks that were actually used
   const actuallyUsed = availablePlanks.filter(p => p.cuts && p.cuts.length > 0);
   
   return {
@@ -154,14 +139,13 @@ function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, mi
     })),
     unplacedCuts,
     totalCuts: sortedCuts.length - unplacedCuts.length,
-    efficiency: 0 // Will be calculated
+    efficiency: 0 
   };
 }
 
 function calculatePlankWaste(plank, kerfWidth) {
   const totalArea = plank.resto.width_mm * plank.resto.height_mm;
   const usedArea = plank.cuts.reduce((sum, cut) => {
-    // Account for kerf in used area
     const cutArea = cut.width_mm * cut.height_mm;
     const kerfArea = (cut.width_mm + cut.height_mm) * kerfWidth;
     return sum + cutArea + kerfArea;
@@ -217,23 +201,41 @@ function App() {
   const [error, setError] = useState("");
   const [selectedIds, setSelectedIds] = useState([]);
   const [searchActive, setSearchActive] = useState(false);
-  const [activeTab, setActiveTab] = useState("restos"); // "restos", "stats", or "optimizer"
+  const [activeTab, setActiveTab] = useState("restos"); // "restos", "stats", "optimizer", or "estado"
+  const [serverUrlInput, setServerUrlInput] = useState(getServerUrl());
   const [stats, setStats] = useState(null);
   const [filterMaterial, setFilterMaterial] = useState("");
   const [filterThickness, setFilterThickness] = useState("");
 
-  // Cutting optimizer state
+  const [vans, setVans] = useState([]);
+  const [selectedVanId, setSelectedVanId] = useState(null);
+  const [cargoItems, setCargoItems] = useState([]);
+  const [loadingPlan, setLoadingPlan] = useState(null);
+  const [optimizeWarnings, setOptimizeWarnings] = useState([]);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  const [vansLoading, setVansLoading] = useState(true);
+
+  const [estadoData, setEstadoData] = useState({
+    mainServer: { status: 'unknown', uptime: 0 },
+    proxyServer: { status: 'unknown', uptime: 0, db: '', pending: 0 },
+    lastCheck: null
+  });
+
   const [cuttingList, setCuttingList] = useState([]);
   const [optimizationResult, setOptimizationResult] = useState(null);
   const [newCut, setNewCut] = useState({ width_mm: "", height_mm: "", thickness_mm: "18", material: "MDF", quantity: "1", label: "" });
 
-  // Settings state
   const [settings, setSettings] = useState({ kerfWidth: 3, minRemainderWidth: 300, minRemainderHeight: 300 });
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [addOpen, setAddOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+
+  const [vanModalOpen, setVanModalOpen] = useState(false);
+  const [editingVan, setEditingVan] = useState(null);
+  const [cargoModalOpen, setCargoModalOpen] = useState(false);
+  const [editingCargo, setEditingCargo] = useState(null);
 
   const [addForm, setAddForm] = useState({ width_mm: "", height_mm: "", thickness_mm: "18", material: "MDF", notes: "" });
   const [searchForm, setSearchForm] = useState({ width_mm: "", height_mm: "", thickness_mm: "18", material: "MDF" });
@@ -242,9 +244,7 @@ function App() {
   const tableRef = useRef(null);
 
   useEffect(() => {
-    // Keyboard shortcuts
     const handleKeyDown = (e) => {
-      // ESC to close any open modal
       if (e.key === 'Escape') {
         if (addOpen) setAddOpen(false);
         if (searchOpen) setSearchOpen(false);
@@ -253,17 +253,14 @@ function App() {
         return;
       }
 
-      // Only handle Del/Enter on restos tab
       if (activeTab !== 'restos') return;
 
-      // Delete key to remove selected items
       if (e.key === 'Delete' && selectedIds.length > 0) {
         e.preventDefault();
         handleRemoveSelected();
         return;
       }
 
-      // Enter key to edit first selected item
       if (e.key === 'Enter' && selectedIds.length > 0 && !addOpen && !searchOpen && !editOpen) {
         e.preventDefault();
         handleEditClick();
@@ -276,7 +273,6 @@ function App() {
   }, [activeTab, selectedIds, addOpen, searchOpen, editOpen, settingsOpen]);
 
   useEffect(() => {
-    // Make table headers resizable
     const headers = tableRef.current?.querySelectorAll('th');
     if (!headers) return;
 
@@ -338,6 +334,44 @@ function App() {
     }
   }
 
+  async function fetchEstado() {
+    const newEstado = {
+      mainServer: { status: 'error', uptime: 0 },
+      proxyServer: { status: 'error', uptime: 0, db: '', pending: 0 },
+      lastCheck: new Date().toLocaleTimeString('pt-PT')
+    };
+
+    try {
+      const response = await fetch('http://localhost:8000/health');
+      if (response.ok) {
+        const data = await response.json();
+        newEstado.mainServer.status = data.status === 'ok' ? 'ok' : 'error';
+      }
+    } catch (e) {
+      console.error('Main server health check failed:', e);
+    }
+
+    try {
+      const healthRes = await fetch('http://localhost:8001/health');
+      if (healthRes.ok) {
+        const health = await healthRes.json();
+        newEstado.proxyServer.status = health.proxy_active ? 'ok' : 'error';
+        newEstado.proxyServer.uptime = health.uptime_seconds || 0;
+        newEstado.proxyServer.db = health.db_path || '';
+      }
+
+      const syncRes = await fetch('http://localhost:8001/sync/status');
+      if (syncRes.ok) {
+        const sync = await syncRes.json();
+        newEstado.proxyServer.pending = sync.pending_changes || 0;
+      }
+    } catch (e) {
+      console.error('Proxy server health check failed:', e);
+    }
+
+    setEstadoData(newEstado);
+  }
+
   async function refresh() {
     try {
       setLoading(true);
@@ -357,16 +391,124 @@ function App() {
     }
   }
 
+  async function loadVans() {
+    try {
+      setVansLoading(true);
+      const data = await listVans();
+      setVans(data);
+    } catch (err) {
+      console.error('Failed to load vans:', err);
+      alert('Erro ao carregar carrinhas');
+    } finally {
+      setVansLoading(false);
+    }
+  }
+
+  function handleAddVan() {
+    setEditingVan(null);
+    setVanModalOpen(true);
+  }
+
+  function handleEditVan(van) {
+    setEditingVan(van);
+    setVanModalOpen(true);
+  }
+
+  async function handleSaveVan(vanData) {
+    try {
+      if (editingVan) {
+        await updateVan(editingVan.id, vanData);
+      } else {
+        await addVan(vanData);
+      }
+      setVanModalOpen(false);
+      await loadVans(); 
+    } catch (err) {
+      console.error('Failed to save van:', err);
+      alert(`Erro ao guardar carrinha: ${err.message}`);
+    }
+  }
+
+  async function handleDeleteVan(vanId) {
+    if (confirm('Desativar esta carrinha?')) {
+      try {
+        await deleteVan(vanId);
+        if (selectedVanId === vanId) {
+          setSelectedVanId(null);
+        }
+        await loadVans(); 
+      } catch (err) {
+        console.error('Failed to delete van:', err);
+        alert('Erro ao desativar carrinha');
+      }
+    }
+  }
+
+  function handleAddCargo() {
+    if (!selectedVanId) return;
+    setEditingCargo(null);
+    setCargoModalOpen(true);
+  }
+
+  function handleEditCargo(cargo, index) {
+    setEditingCargo({ ...cargo, index });
+    setCargoModalOpen(true);
+  }
+
+  function handleSaveCargo(cargoData) {
+    if (editingCargo && editingCargo.index !== undefined) {
+      setCargoItems(prev => prev.map((item, idx) => idx === editingCargo.index ? cargoData : item));
+    } else {
+      setCargoItems(prev => [...prev, cargoData]);
+    }
+    setCargoModalOpen(false);
+  }
+
+  function handleDeleteCargo(index) {
+    if (confirm('Remover este item?')) {
+      setCargoItems(prev => prev.filter((_, idx) => idx !== index));
+    }
+  }
+
+  async function handleGeneratePlan() {
+    if (!selectedVanId || cargoItems.length === 0) return;
+    
+    try {
+      setIsOptimizing(true);
+      setOptimizeWarnings([]);
+      const result = await optimizeLoading(selectedVanId, cargoItems);
+      
+      if (result.success && result.plan) {
+        setLoadingPlan(result.plan);
+        setOptimizeWarnings(result.warnings || []);
+      } else {
+        alert('Falha na otimização');
+      }
+    } catch (err) {
+      console.error('Optimization failed:', err);
+      alert('Erro ao gerar plano de carregamento');
+    } finally {
+      setIsOptimizing(false);
+    }
+  }
+
   useEffect(() => { refresh(); }, []);
 
   useEffect(() => {
-    if (activeTab === "stats") {
-      refreshStats();
+    if (activeTab === 'carrinhas') {
+      loadVans();
     }
   }, [activeTab]);
 
   useEffect(() => {
-    // Apply quick filters
+    if (activeTab === "stats") {
+      refreshStats();
+    } else if (activeTab === "estado") {
+      fetchEstado();
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
     let filtered = searchActive ? filteredInventory : inventory;
     
     if (filterMaterial) {
@@ -414,7 +556,6 @@ function App() {
       
       const requiredArea = Number(searchForm.width_mm) * Number(searchForm.height_mm);
       
-      // Filter locally based on search criteria
       const filtered = inventory.filter((r) => 
         r.width_mm >= Number(searchForm.width_mm) &&
         r.height_mm >= Number(searchForm.height_mm) &&
@@ -422,7 +563,6 @@ function App() {
         r.material === searchForm.material.trim()
       );
       
-      // Sort by best fit (smallest waste area first)
       const sorted = filtered.sort((a, b) => {
         const areaA = a.width_mm * a.height_mm;
         const areaB = b.width_mm * b.height_mm;
@@ -436,7 +576,6 @@ function App() {
       setSearchOpen(false);
       
       if (sorted.length > 0) {
-        // Select the best match (first one after sorting)
         setSelectedId(sorted[0].id);
         setTimeout(() => {
           const el = document.getElementById(`row-${sorted[0].id}`);
@@ -557,6 +696,8 @@ function App() {
         <button className={`tab folder ${activeTab === "restos" ? "active" : ""}`} onClick={() => setActiveTab("restos")}>Retalhos</button>
         <button className={`tab folder ${activeTab === "stats" ? "active" : ""}`} onClick={() => setActiveTab("stats")}>Estatísticas</button>
         <button className={`tab folder ${activeTab === "optimizer" ? "active" : ""}`} onClick={() => setActiveTab("optimizer")}>Otimizador</button>
+        <button className={`tab folder ${activeTab === "carrinhas" ? "active" : ""}`} onClick={() => setActiveTab("carrinhas")}>Carrinhas</button>
+        <button className={`tab folder ${activeTab === "estado" ? "active" : ""}`} onClick={() => setActiveTab("estado")}>Estado</button>
       </nav>
 
       {error && <div className="banner error">{error}</div>}
@@ -750,7 +891,6 @@ function App() {
               className="btn primary" 
               disabled={cuttingList.length === 0}
               onClick={() => {
-                // Run optimization
                 const result = optimizeCuts(cuttingList, inventory, settings);
                 setOptimizationResult(result);
               }}
@@ -784,7 +924,6 @@ function App() {
                   <button 
                     className="btn primary"
                     onClick={async () => {
-                      // Remove used planks from inventory and clear cutting list
                       try {
                         setLoading(true);
                         for (const plank of optimizationResult.usedPlanks) {
@@ -853,11 +992,254 @@ function App() {
       </section>
       )}
 
+      {activeTab === "carrinhas" && (
+      <section className="content">
+        <div className="van-loader-layout" style={{display: 'flex', gap: '20px', height: '100%'}}>
+          {/* Left Panel - Van Selection & Cargo List */}
+          <aside className="van-sidebar" style={{flex: '0 0 350px', display: 'flex', flexDirection: 'column', gap: '20px'}}>
+            {/* Van Management */}
+            <div className="panel">
+              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+                <h3>Carrinhas Disponíveis</h3>
+                <button className="btn btn-primary" onClick={handleAddVan}>+ Nova Carrinha</button>
+              </div>
+              {vansLoading ? (
+                <div className="empty-state" style={{padding: '20px', textAlign: 'center', color: '#666'}}>
+                  <p>A carregar carrinhas...</p>
+                </div>
+              ) : vans.filter(v => v.active).length === 0 ? (
+                <div className="empty-state" style={{padding: '20px', textAlign: 'center', color: '#666'}}>
+                  <p>Nenhuma carrinha disponível.</p>
+                  <p className="small">Adicione a primeira carrinha para começar.</p>
+                </div>
+              ) : (
+                <div className="van-list">
+                  {vans.filter(v => v.active).map(van => (
+                    <div 
+                      key={van.id} 
+                      className={`van-item ${selectedVanId === van.id ? 'selected' : ''}`}
+                      style={{padding: '10px', border: '1px solid #ccc', marginBottom: '5px', background: selectedVanId === van.id ? '#e3f2fd' : 'white'}}
+                    >
+                      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'start'}}>
+                        <div style={{flex: 1, cursor: 'pointer'}} onClick={() => setSelectedVanId(van.id)}>
+                          <strong>{van.name}</strong>
+                          <div className="small muted">
+                            {van.length_mm}×{van.width_mm}×{van.height_mm} mm
+                            {van.max_weight_kg && ` | ${van.max_weight_kg}kg`}
+                          </div>
+                        </div>
+                        <div style={{display: 'flex', gap: '5px'}}>
+                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleEditVan(van); }} title="Editar">✎</button>
+                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleDeleteVan(van.id); }} title="Desativar">🗑</button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Cargo Items */}
+            <div className="panel" style={{flex: 1, display: 'flex', flexDirection: 'column'}}>
+              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+                <h3>Itens a Carregar</h3>
+                <button className="btn btn-primary" disabled={!selectedVanId} onClick={handleAddCargo}>+ Adicionar Item</button>
+              </div>
+              {cargoItems.length === 0 ? (
+                <div className="empty-state" style={{padding: '20px', textAlign: 'center', color: '#666'}}>
+                  <p>Nenhum item adicionado.</p>
+                  {selectedVanId && <p className="small">Adicione móveis para planejar a carga.</p>}
+                  {!selectedVanId && <p className="small">Selecione uma carrinha primeiro.</p>}
+                </div>
+              ) : (
+                <div className="cargo-list" style={{flex: 1, overflowY: 'auto'}}>
+                  {cargoItems.map((item, idx) => (
+                    <div key={idx} className="cargo-item" style={{padding: '8px', border: '1px solid #ddd', marginBottom: '5px', background: 'white'}}>
+                      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'start'}}>
+                        <div style={{flex: 1}}>
+                          <strong>{item.description || `Item ${idx + 1}`}</strong>
+                          <div className="small muted">
+                            {item.length_mm}×{item.width_mm}×{item.height_mm} mm
+                            {item.weight_kg && ` | ${item.weight_kg}kg`}
+                            {item.fragile && ' | 🔴 Frágil'}
+                          </div>
+                        </div>
+                        <div style={{display: 'flex', gap: '5px'}}>
+                          <button className="btn-icon" onClick={() => handleEditCargo(item, idx)} title="Editar">✎</button>
+                          <button className="btn-icon" onClick={() => handleDeleteCargo(idx)} title="Remover">×</button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {cargoItems.length > 0 && selectedVanId && (
+                <button 
+                  className="btn btn-success" 
+                  style={{marginTop: '10px'}} 
+                  onClick={handleGeneratePlan}
+                  disabled={isOptimizing}
+                >
+                  {isOptimizing ? 'A processar...' : 'Gerar Plano de Carregamento'}
+                </button>
+              )}
+              
+              {/* Warnings display */}
+              {optimizeWarnings.length > 0 && (
+                <div style={{marginTop: '10px', padding: '10px', background: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px'}}>
+                  <strong style={{color: '#856404'}}>⚠ Avisos:</strong>
+                  <ul style={{margin: '5px 0 0 0', paddingLeft: '20px', color: '#856404', fontSize: '12px'}}>
+                    {optimizeWarnings.map((warn, idx) => (
+                      <li key={idx}>{warn}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </aside>
+
+          {/* Main Panel - 3D Visualization */}
+          <main className="van-visualization" style={{flex: 1, display: 'flex', flexDirection: 'column', background: '#f5f5f5', border: '1px solid #ccc', borderRadius: '4px'}}>
+            {!selectedVanId ? (
+              <div style={{display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#999'}}>
+                <div style={{textAlign: 'center'}}>
+                  <h2>Selecione uma carrinha</h2>
+                  <p>Escolha uma carrinha à esquerda para visualizar o plano de carregamento</p>
+                </div>
+              </div>
+            ) : !loadingPlan ? (
+              <div style={{display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#999'}}>
+                <div style={{textAlign: 'center'}}>
+                  <h2>Visualização 3D</h2>
+                  <p>Adicione itens e clique em "Gerar Plano" para ver a otimização</p>
+                  <p className="small muted">(Three.js isométrico será implementado aqui)</p>
+                </div>
+              </div>
+            ) : (
+              <div style={{padding: '20px'}}>
+                <div className="panel-header">
+                  <h3>Plano de Carregamento</h3>
+                </div>
+                
+                {/* Stats */}
+                <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px', marginBottom: '20px'}}>
+                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                    <div className="small muted">Items</div>
+                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.items.length}</div>
+                  </div>
+                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                    <div className="small muted">Peso Total</div>
+                    <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.total_weight.toFixed(1)} kg</div>
+                  </div>
+                  <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
+                    <div className="small muted">Utilização</div>
+                    <div style={{fontSize: '20px', fontWeight: 'bold', color: loadingPlan.utilization_percent > 80 ? '#28a745' : loadingPlan.utilization_percent > 50 ? '#ffc107' : '#dc3545'}}>
+                      {loadingPlan.utilization_percent.toFixed(1)}%
+                    </div>
+                  </div>
+                </div>
+
+                {/* 3D Visualization placeholder */}
+                <div style={{background: 'white', border: '1px solid #ddd', borderRadius: '4px', padding: '40px', textAlign: 'center', minHeight: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
+                  <div>
+                    <h3 style={{color: '#999'}}>Visualização 3D</h3>
+                    <p className="small muted">(Three.js isométrico será implementado aqui)</p>
+                    <p className="small muted">Volume usado: {loadingPlan.used_volume.toLocaleString()} mm³ / {loadingPlan.van_volume.toLocaleString()} mm³</p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </main>
+        </div>
+      </section>
+      )}
+
+      {activeTab === "estado" && (
+      <section className="content">\
+        <div className="stats-pane">
+          <div className="estado-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+            <h2>Estado dos Serviços</h2>
+            <button className="btn" onClick={fetchEstado}>↻ Atualizar</button>
+          </div>
+          {estadoData.lastCheck && (
+            <p className="muted small" style={{marginBottom: '20px'}}>Última verificação: {estadoData.lastCheck}</p>
+          )}
+          <div className="stats-grid">
+            <div className="stat-card">
+              <h3>Servidor Principal (RustServer)</h3>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Estado:</span>
+                <div className="estado-indicator" style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span className={`led ${estadoData.mainServer.status === 'ok' ? 'led-green' : estadoData.mainServer.status === 'unknown' ? 'led-gray' : 'led-red'}`} style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: estadoData.mainServer.status === 'ok' ? '#4CAF50' : estadoData.mainServer.status === 'unknown' ? '#999' : '#f44336'}}></span>
+                  <strong>{estadoData.mainServer.status === 'ok' ? 'Online' : estadoData.mainServer.status === 'unknown' ? 'Desconhecido' : 'Offline'}</strong>
+                </div>
+              </div>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Porta:</span>
+                <strong>8000</strong>
+              </div>
+            </div>
+
+            <div className="stat-card">
+              <h3>Proxy Service (Windows 11)</h3>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Estado:</span>
+                <div className="estado-indicator" style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span className={`led ${estadoData.proxyServer.status === 'ok' ? 'led-green' : estadoData.proxyServer.status === 'unknown' ? 'led-gray' : 'led-red'}`} style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: estadoData.proxyServer.status === 'ok' ? '#4CAF50' : estadoData.proxyServer.status === 'unknown' ? '#999' : '#f44336'}}></span>
+                  <strong>{estadoData.proxyServer.status === 'ok' ? 'Online' : estadoData.proxyServer.status === 'unknown' ? 'Desconhecido' : 'Offline'}</strong>
+                </div>
+              </div>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Porta:</span>
+                <strong>8001</strong>
+              </div>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Uptime:</span>
+                <strong>{estadoData.proxyServer.uptime > 0 ? `${Math.floor(estadoData.proxyServer.uptime / 60)}m ${estadoData.proxyServer.uptime % 60}s` : '-'}</strong>
+              </div>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Base de Dados:</span>
+                <strong style={{fontSize: '0.85em', wordBreak: 'break-all'}}>{estadoData.proxyServer.db || '-'}</strong>
+              </div>
+              <div className="estado-row" style={{display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #ccc'}}>
+                <span>Sincronizações Pendentes:</span>
+                <strong style={{color: estadoData.proxyServer.pending > 0 ? '#ff9800' : 'inherit'}}>{estadoData.proxyServer.pending}</strong>
+              </div>
+            </div>
+
+            <div className="stat-card">
+              <h3>Legenda</h3>
+              <div className="estado-row" style={{display: 'flex', alignItems: 'center', gap: '12px', padding: '8px 0'}}>
+                <div className="estado-indicator" style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span className="led led-green" style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#4CAF50'}}></span>
+                  <span>Online / OK</span>
+                </div>
+              </div>
+              <div className="estado-row" style={{display: 'flex', alignItems: 'center', gap: '12px', padding: '8px 0'}}>
+                <div className="estado-indicator" style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span className="led led-red" style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#f44336'}}></span>
+                  <span>Offline / Erro</span>
+                </div>
+              </div>
+              <div className="estado-row" style={{display: 'flex', alignItems: 'center', gap: '12px', padding: '8px 0'}}>
+                <div className="estado-indicator" style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span className="led led-gray" style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#999'}}></span>
+                  <span>Desconhecido</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      )}
+
       <footer className="statusbar">
         <div>
           {activeTab === "restos" && `${filteredInventory.length} itens${searchActive ? ` (filtrados de ${inventory.length})` : ""}`}
           {activeTab === "stats" && "Estatísticas"}
           {activeTab === "optimizer" && `${cuttingList.length} peças na lista de corte`}
+          {activeTab === "carrinhas" && `${vans.length} carrinhas | ${cargoItems.length} itens a carregar`}
+          {activeTab === "estado" && "Monitorização de serviços"}
         </div>
         <div className="spacer"/>
         <div>
@@ -1012,6 +1394,271 @@ function App() {
               </label>
               <div className="modal-actions">
                 <button type="button" className="btn" onClick={()=>setSettingsOpen(false)}>Fechar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Van Modal */}
+      {vanModalOpen && (
+        <div className="modal-overlay" onClick={() => setVanModalOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h2>{editingVan ? 'Editar Carrinha' : 'Nova Carrinha'}</h2>
+            <form onSubmit={(e) => {
+              e.preventDefault();
+              const formData = new FormData(e.target);
+              const maxWeight = formData.get('max_weight_kg');
+              const wheelHeight = formData.get('wheel_well_height_mm');
+              const wheelWidth = formData.get('wheel_well_width_mm');
+              const wheelStart = formData.get('wheel_well_start_x_mm');
+              handleSaveVan({
+                name: formData.get('name'),
+                length_mm: Number(formData.get('length_mm')),
+                width_mm: Number(formData.get('width_mm')),
+                height_mm: Number(formData.get('height_mm')),
+                max_weight_kg: maxWeight && Number(maxWeight) > 0 ? Number(maxWeight) : null,
+                wheel_well_height_mm: wheelHeight && Number(wheelHeight) > 0 ? Number(wheelHeight) : null,
+                wheel_well_width_mm: wheelWidth && Number(wheelWidth) > 0 ? Number(wheelWidth) : null,
+                wheel_well_start_x_mm: wheelStart && Number(wheelStart) > 0 ? Number(wheelStart) : null,
+                notes: formData.get('notes') || null
+              });
+            }}>
+              <div className="form-grid">
+                <label>
+                  Nome:
+                  <input 
+                    type="text" 
+                    name="name" 
+                    defaultValue={editingVan?.name || ''} 
+                    required 
+                    placeholder="Carrinha 1, Sprinter..." 
+                    autoFocus 
+                  />
+                </label>
+                <label>
+                  Comprimento (mm):
+                  <input 
+                    type="number" 
+                    name="length_mm" 
+                    defaultValue={editingVan?.length_mm || ''} 
+                    required 
+                    min="500" 
+                    max="10000" 
+                    placeholder="3000" 
+                  />
+                </label>
+                <label>
+                  Largura (mm):
+                  <input 
+                    type="number" 
+                    name="width_mm" 
+                    defaultValue={editingVan?.width_mm || ''} 
+                    required 
+                    min="500" 
+                    max="5000" 
+                    placeholder="1800" 
+                  />
+                </label>
+                <label>
+                  Altura (mm):
+                  <input 
+                    type="number" 
+                    name="height_mm" 
+                    defaultValue={editingVan?.height_mm || ''} 
+                    required 
+                    min="500" 
+                    max="5000" 
+                    placeholder="1900" 
+                  />
+                </label>
+                <label>
+                  Capacidade Máxima (kg):
+                  <input 
+                    type="number" 
+                    name="max_weight_kg" 
+                    defaultValue={editingVan?.max_weight_kg || ''} 
+                    min="0" 
+                    max="5000" 
+                    placeholder="1000 (opcional)" 
+                  />
+                </label>
+                <label>
+                  Altura Rodas (mm):
+                  <input 
+                    type="number" 
+                    name="wheel_well_height_mm" 
+                    defaultValue={editingVan?.wheel_well_height_mm || ''} 
+                    min="0" 
+                    max="1000" 
+                    placeholder="300 (opcional)" 
+                    title="Altura que as rodas ocupam no chão"
+                  />
+                </label>
+                <label>
+                  Largura Rodas (mm):
+                  <input 
+                    type="number" 
+                    name="wheel_well_width_mm" 
+                    defaultValue={editingVan?.wheel_well_width_mm || ''} 
+                    min="0" 
+                    max="1000" 
+                    placeholder="400 (opcional)" 
+                    title="Largura da intrusão das rodas de cada lado"
+                  />
+                </label>
+                <label>
+                  Início Rodas (mm):
+                  <input 
+                    type="number" 
+                    name="wheel_well_start_x_mm" 
+                    defaultValue={editingVan?.wheel_well_start_x_mm || ''} 
+                    min="0" 
+                    max="5000" 
+                    placeholder="1500 (opcional)" 
+                    title="Distância da traseira onde as rodas começam"
+                  />
+                </label>
+                <label style={{gridColumn: '1 / -1'}}>
+                  Notas:
+                  <textarea 
+                    name="notes" 
+                    defaultValue={editingVan?.notes || ''} 
+                    rows="2" 
+                    placeholder="Informações adicionais..."
+                  />
+                </label>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn" onClick={() => setVanModalOpen(false)}>Cancelar</button>
+                <button type="submit" className="btn btn-primary">{editingVan ? 'Guardar' : 'Adicionar'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Cargo Modal */}
+      {cargoModalOpen && (
+        <div className="modal-overlay" onClick={() => setCargoModalOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h2>{editingCargo ? 'Editar Item' : 'Adicionar Item de Carga'}</h2>
+            <form onSubmit={(e) => {
+              e.preventDefault();
+              const formData = new FormData(e.target);
+              handleSaveCargo({
+                description: formData.get('description'),
+                length_mm: Number(formData.get('length_mm')),
+                width_mm: Number(formData.get('width_mm')),
+                height_mm: Number(formData.get('height_mm')),
+                weight_kg: Number(formData.get('weight_kg')) || 0,
+                fragile: formData.get('fragile') === 'on',
+                rotation_allowed: formData.get('rotation_allowed') === 'on',
+                stackable: formData.get('stackable') === 'on',
+                color: formData.get('color') || '#74c0fc'
+              });
+            }}>
+              <div className="form-grid">
+                <label style={{gridColumn: '1 / -1'}}>
+                  Descrição:
+                  <input 
+                    type="text" 
+                    name="description" 
+                    defaultValue={editingCargo?.description || ''} 
+                    required 
+                    placeholder="Armário MDF, Mesa, Estante..." 
+                    autoFocus 
+                  />
+                </label>
+                <label>
+                  Comprimento (mm):
+                  <input 
+                    type="number" 
+                    name="length_mm" 
+                    defaultValue={editingCargo?.length_mm || ''} 
+                    required 
+                    min="10" 
+                    max="5000" 
+                    placeholder="2000" 
+                  />
+                </label>
+                <label>
+                  Largura (mm):
+                  <input 
+                    type="number" 
+                    name="width_mm" 
+                    defaultValue={editingCargo?.width_mm || ''} 
+                    required 
+                    min="10" 
+                    max="5000" 
+                    placeholder="600" 
+                  />
+                </label>
+                <label>
+                  Altura (mm):
+                  <input 
+                    type="number" 
+                    name="height_mm" 
+                    defaultValue={editingCargo?.height_mm || ''} 
+                    required 
+                    min="10" 
+                    max="5000" 
+                    placeholder="1800" 
+                  />
+                </label>
+                <label>
+                  Peso (kg):
+                  <input 
+                    type="number" 
+                    name="weight_kg" 
+                    defaultValue={editingCargo?.weight_kg || ''} 
+                    min="0.1" 
+                    max="500" 
+                    step="0.1" 
+                    placeholder="80" 
+                  />
+                </label>
+                <label>
+                  Cor (visualização):
+                  <input 
+                    type="color" 
+                    name="color" 
+                    defaultValue={editingCargo?.color || '#74c0fc'} 
+                  />
+                </label>
+              </div>
+              <div style={{display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px'}}>
+                <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
+                  <input 
+                    type="checkbox" 
+                    name="fragile" 
+                    defaultChecked={editingCargo?.fragile || false}
+                    style={{accentColor: '#d32f2f', margin: 0, flexShrink: 0}}
+                  />
+                  <span style={{whiteSpace: 'nowrap'}}>Frágil</span>
+                </label>
+                <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
+                  <input 
+                    type="checkbox" 
+                    name="rotation_allowed" 
+                    defaultChecked={editingCargo?.rotation_allowed !== false}
+                    style={{accentColor: '#1976d2', margin: 0, flexShrink: 0}}
+                  />
+                  <span style={{whiteSpace: 'nowrap'}}>Permitir rotação</span>
+                </label>
+                <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
+                  <input 
+                    type="checkbox" 
+                    name="stackable" 
+                    defaultChecked={editingCargo?.stackable !== false}
+                    style={{accentColor: '#388e3c', margin: 0, flexShrink: 0}}
+                  />
+                  <span style={{whiteSpace: 'nowrap'}}>Empilhável</span>
+                </label>
+              </div>
+              <div className="modal-actions" style={{marginTop: '12px'}}>
+                <button type="button" className="btn" onClick={() => setCargoModalOpen(false)}>Cancelar</button>
+                <button type="submit" className="btn btn-primary">{editingCargo ? 'Guardar' : 'Adicionar'}</button>
               </div>
             </form>
           </div>

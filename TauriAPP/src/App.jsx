@@ -1,165 +1,57 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, getServerUrl, setServerUrl } from "./api";
+import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, optimizeCuts as optimizeCutsAPI, getServerUrl, setServerUrl } from "./api";
 import VanVisualization from "./VanVisualization";
 
-function optimizeCuts(cuttingList, inventory, settings) {
+async function optimizeCuts(cuttingList, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
   
-  const allCuts = [];
-  cuttingList.forEach(cut => {
-    for (let i = 0; i < cut.quantity; i++) {
-      allCuts.push({ ...cut, originalId: cut.id, cutId: `${cut.id}-${i}` });
-    }
-  });
+  // Transform cuttingList to API format
+  const cuts = cuttingList.map(cut => ({
+    width_mm: parseInt(cut.width_mm),
+    height_mm: parseInt(cut.height_mm),
+    thickness_mm: parseInt(cut.thickness_mm),
+    material: cut.material,
+    quantity: parseInt(cut.quantity)
+  }));
   
-  const strategies = [
-    { sortBy: 'area-desc', label: 'Largest area first' },
-    { sortBy: 'width-desc', label: 'Widest first' },
-    { sortBy: 'height-desc', label: 'Tallest first' },
-    { sortBy: 'perimeter-desc', label: 'Largest perimeter first' }
-  ];
+  console.log('Sending cuts to API:', cuts);
   
-  let bestResult = null;
-  let bestEfficiency = 0;
+  // Call backend API
+  const response = await optimizeCutsAPI(cuts, kerfWidth, minRemainderWidth, minRemainderHeight);
   
-  for (const strategy of strategies) {
-    const result = tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, minRemainderHeight, strategy.sortBy);
-    const efficiency = calculateEfficiency(result);
-    
-    if (efficiency > bestEfficiency || !bestResult) {
-      bestEfficiency = efficiency;
-      bestResult = result;
-    }
+  console.log('Received response from API:', response);
+  
+  // Check if response is valid
+  if (!response || !response.used_planks) {
+    throw new Error('Invalid response from server');
   }
   
-  return bestResult;
-}
-
-function tryPackingStrategy(allCuts, inventory, kerfWidth, minRemainderWidth, minRemainderHeight, sortBy) {
-  const sortedCuts = [...allCuts].sort((a, b) => {
-    if (sortBy === 'area-desc') return (b.width_mm * b.height_mm) - (a.width_mm * a.height_mm);
-    if (sortBy === 'width-desc') return b.width_mm - a.width_mm;
-    if (sortBy === 'height-desc') return b.height_mm - a.height_mm;
-    if (sortBy === 'perimeter-desc') return (b.width_mm + b.height_mm) - (a.width_mm + a.height_mm);
-    return 0;
-  });
-  
-  const usedPlanks = [];
-  const unplacedCuts = [];
-  
-  const availablePlanks = inventory
-    .map(resto => ({ resto, freeRects: [{ x: 0, y: 0, width: resto.width_mm, height: resto.height_mm }] }))
-    .sort((a, b) => (a.resto.width_mm * a.resto.height_mm) - (b.resto.width_mm * b.resto.height_mm));
-  
-  for (const cut of sortedCuts) {
-    let placed = false;
-    
-    for (const plank of availablePlanks) {
-      if (plank.resto.material.toLowerCase() !== cut.material.toLowerCase()) continue;
-      if (plank.resto.thickness_mm !== cut.thickness_mm) continue;
-      
-      const orientations = [
-        { w: cut.width_mm, h: cut.height_mm, rotated: false },
-        { w: cut.height_mm, h: cut.width_mm, rotated: true }
-      ];
-      
-      for (const orient of orientations) {
-        let bestRect = null;
-        let bestRectIndex = -1;
-        let bestWaste = Infinity;
-        
-        for (let i = 0; i < plank.freeRects.length; i++) {
-          const rect = plank.freeRects[i];
-          if (rect.width >= orient.w && rect.height >= orient.h) {
-            const waste = (rect.width * rect.height) - (orient.w * orient.h);
-            if (waste < bestWaste) {
-              bestWaste = waste;
-              bestRect = rect;
-              bestRectIndex = i;
-            }
-          }
-        }
-        
-        if (bestRect) {
-          const placedCut = {
-            ...cut,
-            x: bestRect.x,
-            y: bestRect.y,
-            width_mm: orient.w,
-            height_mm: orient.h,
-            rotated: orient.rotated
-          };
-          
-          if (!plank.cuts) plank.cuts = [];
-          plank.cuts.push(placedCut);
-          
-          plank.freeRects.splice(bestRectIndex, 1);
-          
-          const rightRect = {
-            x: bestRect.x + orient.w + kerfWidth,
-            y: bestRect.y,
-            width: bestRect.width - orient.w - kerfWidth,
-            height: orient.h
-          };
-          
-          const bottomRect = {
-            x: bestRect.x,
-            y: bestRect.y + orient.h + kerfWidth,
-            width: bestRect.width,
-            height: bestRect.height - orient.h - kerfWidth
-          };
-          
-          if (rightRect.width >= minRemainderWidth && rightRect.height >= minRemainderHeight) {
-            plank.freeRects.push(rightRect);
-          }
-          if (bottomRect.width >= minRemainderWidth && bottomRect.height >= minRemainderHeight) {
-            plank.freeRects.push(bottomRect);
-          }
-          
-          placed = true;
-          break;
-        }
-      }
-      
-      if (placed) break;
-    }
-    
-    if (!placed) {
-      unplacedCuts.push(cut);
-    }
-  }
-  
-  const actuallyUsed = availablePlanks.filter(p => p.cuts && p.cuts.length > 0);
-  
+  // Transform response to match old format for UI compatibility
   return {
-    usedPlanks: actuallyUsed.map(p => ({
-      resto: p.resto,
-      cuts: p.cuts,
-      wastePercent: calculatePlankWaste(p, kerfWidth)
+    usedPlanks: response.used_planks.map(plank => ({
+      resto: {
+        id: plank.resto_id,
+        width_mm: plank.width_mm,
+        height_mm: plank.height_mm,
+        thickness_mm: plank.thickness_mm,
+        material: plank.material
+      },
+      cuts: plank.cuts.map(cut => ({
+        x: cut.x,
+        y: cut.y,
+        width_mm: cut.width,
+        height_mm: cut.height,
+        rotated: cut.rotated,
+        material: cut.material,
+        thickness_mm: cut.thickness_mm
+      })),
+      wastePercent: plank.waste_percent
     })),
-    unplacedCuts,
-    totalCuts: sortedCuts.length - unplacedCuts.length,
-    efficiency: 0 
+    unplacedCuts: (response.unplaced_cuts || []).map(([idx, cut]) => cut),
+    totalCuts: response.total_cuts_placed || 0,
+    efficiency: response.efficiency_percent || 0
   };
-}
-
-function calculatePlankWaste(plank, kerfWidth) {
-  const totalArea = plank.resto.width_mm * plank.resto.height_mm;
-  const usedArea = plank.cuts.reduce((sum, cut) => {
-    const cutArea = cut.width_mm * cut.height_mm;
-    const kerfArea = (cut.width_mm + cut.height_mm) * kerfWidth;
-    return sum + cutArea + kerfArea;
-  }, 0);
-  return ((totalArea - usedArea) / totalArea) * 100;
-}
-
-function calculateEfficiency(result) {
-  if (result.usedPlanks.length === 0) return 0;
-  const totalArea = result.usedPlanks.reduce((sum, p) => sum + (p.resto.width_mm * p.resto.height_mm), 0);
-  const wasteArea = result.usedPlanks.reduce((sum, p) => sum + (p.resto.width_mm * p.resto.height_mm * p.wastePercent / 100), 0);
-  result.efficiency = ((totalArea - wasteArea) / totalArea) * 100;
-  return result.efficiency;
 }
 
 function IconSearch(props) {
@@ -226,7 +118,7 @@ function App() {
   const [optimizationResult, setOptimizationResult] = useState(null);
   const [newCut, setNewCut] = useState({ width_mm: "", height_mm: "", thickness_mm: "18", material: "MDF", quantity: "1", label: "" });
 
-  const [settings, setSettings] = useState({ kerfWidth: 3, minRemainderWidth: 300, minRemainderHeight: 300 });
+  const [settings, setSettings] = useState({ kerfWidth: 3, minRemainderWidth: 100, minRemainderHeight: 100 });
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [addOpen, setAddOpen] = useState(false);
@@ -890,13 +782,21 @@ function App() {
             </div>
             <button 
               className="btn primary" 
-              disabled={cuttingList.length === 0}
-              onClick={() => {
-                const result = optimizeCuts(cuttingList, inventory, settings);
-                setOptimizationResult(result);
+              disabled={cuttingList.length === 0 || loading}
+              onClick={async () => {
+                try {
+                  setLoading(true);
+                  const result = await optimizeCuts(cuttingList, settings);
+                  setOptimizationResult(result);
+                } catch (error) {
+                  console.error('Optimization failed:', error);
+                  alert('Erro ao otimizar cortes: ' + error.message);
+                } finally {
+                  setLoading(false);
+                }
               }}
             >
-              Otimizar Cortes
+              {loading ? 'A otimizar...' : 'Otimizar Cortes'}
             </button>
           </div>
           <div className="optimizer-main">
@@ -975,7 +875,7 @@ function App() {
                       <div className="plank-waste">Desperdício: {plank.wastePercent.toFixed(1)}%</div>
                     </div>
                   ))}
-                  {optimizationResult.unplacedCuts.length > 0 && (
+                  {optimizationResult.unplacedCuts && optimizationResult.unplacedCuts.length > 0 && (
                     <div className="alert warning">
                       <strong>Peças não encaixadas:</strong>
                       <ul>

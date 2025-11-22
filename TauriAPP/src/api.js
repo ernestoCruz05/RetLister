@@ -112,3 +112,30 @@ export async function optimizeLoading(van_id, items) {
   }
   return res.json();
 }
+
+export async function optimizeCuts(cuts, kerf_width_mm = 3, min_remainder_width_mm = 100, min_remainder_height_mm = 100) {
+  console.log('API Call - optimizeCuts with:', { cuts, kerf_width_mm, min_remainder_width_mm, min_remainder_height_mm });
+  
+  const res = await fetch(`${SERVER_URL}/optimize_cuts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ 
+      cuts, 
+      kerf_width_mm, 
+      min_remainder_width_mm, 
+      min_remainder_height_mm 
+    }),
+  });
+  
+  console.log('API Response status:', res.status);
+  
+  if (!res.ok) {
+    const error = await res.json();
+    console.error('API Error:', error);
+    throw new Error(error.error || `Optimize cuts failed: ${res.status}`);
+  }
+  
+  const data = await res.json();
+  console.log('API Response data:', data);
+  return data;
+}

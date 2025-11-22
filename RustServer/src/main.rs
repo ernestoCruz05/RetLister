@@ -19,6 +19,9 @@ use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
 use tower_http::LatencyUnit;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod cutting_optimizer;
+use cutting_optimizer::optimize_cuts;
+
 // TODO: Big consideration, but maybe add cut grain direction later.
 
 // Validation constants
@@ -420,6 +423,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/vans/:id", get(get_van).post(update_van).delete(delete_van))
         // Optimize loading (cargo items sent in request body)
         .route("/optimize", post(optimize_loading))
+        // Optimize cutting (cutting list sent in request body)
+        .route("/optimize_cuts", post(optimize_cuts))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))  // Apply auth to all routes above
         .with_state(state)
         .layer(

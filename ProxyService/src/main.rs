@@ -1,14 +1,16 @@
 use axum::{
-    extract::Path,
+    extract::{Path, State},
     http::StatusCode,
-    response::Json,
-    routing::{get, post, delete},
+    response::{IntoResponse, Json},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+
+// ===== DATA STRUCTURES =====
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 struct Resto {
@@ -38,6 +40,12 @@ struct SearchRestoRequest {
     material: String,
 }
 
+// New struct for batch deletion
+#[derive(Debug, Serialize, Deserialize)]
+struct DeleteBatchRequest {
+    ids: Vec<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     proxy_active: bool,
@@ -58,8 +66,9 @@ struct AppState {
     start_time: std::time::Instant,
 }
 
-async fn health_check(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Json<HealthResponse> {
-    // Check if main server is reachable
+// ===== HANDLERS =====
+
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let main_server_active = reqwest::get(&format!("{}/list", state.main_server_url))
         .await
         .is_ok();
@@ -72,20 +81,18 @@ async fn health_check(axum::extract::State(state): axum::extract::State<Arc<AppS
     })
 }
 
-async fn sync_status(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Result<Json<SyncStatus>, StatusCode> {
+async fn sync_status(State(state): State<Arc<AppState>>) -> Result<Json<SyncStatus>, StatusCode> {
     let last_sync = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM sync_metadata WHERE key = 'last_sync_time' LIMIT 1"
+        "SELECT value FROM sync_metadata WHERE key = 'last_sync_time' LIMIT 1",
     )
     .fetch_optional(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let pending = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sync_queue WHERE synced = 0"
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let pending = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_queue WHERE synced = 0")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
     Ok(Json(SyncStatus {
         last_sync,
@@ -93,13 +100,15 @@ async fn sync_status(axum::extract::State(state): axum::extract::State<Arc<AppSt
     }))
 }
 
-async fn list_restos(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Result<Json<Vec<Resto>>, StatusCode> {
+async fn list_restos(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Resto>>, StatusCode> {
+    // Try Main Server
     if let Ok(response) = reqwest::get(&format!("{}/list", state.main_server_url)).await {
         if let Ok(data) = response.json::<Vec<Resto>>().await {
             return Ok(Json(data));
         }
     }
 
+    // Fallback to Local DB
     let restos = sqlx::query_as::<_, Resto>("SELECT * FROM restos ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await
@@ -109,10 +118,12 @@ async fn list_restos(axum::extract::State(state): axum::extract::State<Arc<AppSt
 }
 
 async fn add_resto(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<AddRestoRequest>,
 ) -> Result<Json<Resto>, StatusCode> {
     let client = reqwest::Client::new();
+
+    // Try Main Server
     if let Ok(response) = client
         .post(&format!("{}/add", state.main_server_url))
         .json(&payload)
@@ -120,16 +131,18 @@ async fn add_resto(
         .await
     {
         if let Ok(resto) = response.json::<Resto>().await {
+            // Update local cache
             let _ = save_to_local_db(&state.db, &resto).await;
             return Ok(Json(resto));
         }
     }
 
+    // Offline Mode
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query_as::<_, Resto>(
         "INSERT INTO restos (width_mm, height_mm, thickness_mm, material, notes, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         RETURNING *"
+         RETURNING *",
     )
     .bind(payload.width_mm)
     .bind(payload.height_mm)
@@ -147,10 +160,12 @@ async fn add_resto(
 }
 
 async fn remove_resto(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
     let client = reqwest::Client::new();
+    
+    // Try Main Server
     if client
         .delete(&format!("{}/remove/{}", state.main_server_url, id))
         .send()
@@ -164,6 +179,7 @@ async fn remove_resto(
         return Ok(StatusCode::OK);
     }
 
+    // Offline Mode
     let rows = sqlx::query("DELETE FROM restos WHERE id = ?1")
         .bind(id)
         .execute(&state.db)
@@ -179,14 +195,53 @@ async fn remove_resto(
     Ok(StatusCode::OK)
 }
 
+// --- NEW HANDLER: PROXY DELETE BATCH ---
+async fn proxy_delete_batch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteBatchRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = reqwest::Client::new();
+
+    // 1. Forward to Main Server
+    let response = client
+        .post(&format!("{}/delete_batch", state.main_server_url))
+        .json(&req)
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            // Success on main server -> Sync local DB (delete items from cache)
+            for id in &req.ids {
+                let _ = sqlx::query("DELETE FROM restos WHERE id = ?")
+                    .bind(id)
+                    .execute(&state.db)
+                    .await;
+            }
+            // Return whatever the main server returned
+            let data = resp.json::<serde_json::Value>().await.unwrap_or_default();
+            Ok(Json(data))
+        }
+        _ => {
+            // If main server is unreachable, we return error for now.
+            // (Implementing offline batch delete queueing is complex, 
+            // so we force online for batch ops to ensure consistency)
+            Err(StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+// --- UPDATED HANDLER: SEARCH (POST) ---
 async fn search_resto(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Json(payload): Json<SearchRestoRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<SearchRestoRequest>,
 ) -> Result<Json<Vec<Resto>>, StatusCode> {
     let client = reqwest::Client::new();
+
+    // Try Main Server (POST)
     if let Ok(response) = client
         .post(&format!("{}/search", state.main_server_url))
-        .json(&payload)
+        .json(&params)
         .send()
         .await
     {
@@ -195,24 +250,52 @@ async fn search_resto(
         }
     }
 
+    // Offline Mode: Local Search
     let restos = sqlx::query_as::<_, Resto>(
         "SELECT * FROM restos 
          WHERE width_mm >= ?1 
            AND height_mm >= ?2
            AND thickness_mm = ?3
            AND LOWER(material) = LOWER(?4)
-         ORDER BY (width_mm * height_mm) ASC"
+         ORDER BY (width_mm * height_mm) ASC",
     )
-    .bind(payload.width_mm)
-    .bind(payload.height_mm)
-    .bind(payload.thickness_mm)
-    .bind(&payload.material)
+    .bind(params.width_mm)
+    .bind(params.height_mm)
+    .bind(params.thickness_mm)
+    .bind(&params.material)
     .fetch_all(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(restos))
 }
+
+async fn proxy_optimize_cuts(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&format!("{}/optimize_cuts", state.main_server_url))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if !response.status().is_success() {
+        return Err(StatusCode::from_u16(response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    let data = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(data))
+}
+
+// ===== DB HELPERS =====
 
 async fn save_to_local_db(db: &SqlitePool, resto: &Resto) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -231,11 +314,15 @@ async fn save_to_local_db(db: &SqlitePool, resto: &Resto) -> Result<(), sqlx::Er
     Ok(())
 }
 
-async fn queue_sync_operation(db: &SqlitePool, operation: &str, resto_id: i64) -> Result<(), sqlx::Error> {
+async fn queue_sync_operation(
+    db: &SqlitePool,
+    operation: &str,
+    resto_id: i64,
+) -> Result<(), sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO sync_queue (operation, resto_id, timestamp, synced)
-         VALUES (?1, ?2, ?3, 0)"
+         VALUES (?1, ?2, ?3, 0)",
     )
     .bind(operation)
     .bind(resto_id)
@@ -246,9 +333,8 @@ async fn queue_sync_operation(db: &SqlitePool, operation: &str, resto_id: i64) -
 }
 
 async fn init_db() -> Result<SqlitePool, sqlx::Error> {
-    std::fs::create_dir_all("data")
-        .map_err(|e| sqlx::Error::Io(e))?;
-    
+    std::fs::create_dir_all("data").map_err(|e| sqlx::Error::Io(e))?;
+
     let pool = SqlitePool::connect("sqlite:data/proxy.db").await?;
 
     sqlx::query("PRAGMA journal_mode = WAL;")
@@ -264,7 +350,7 @@ async fn init_db() -> Result<SqlitePool, sqlx::Error> {
             material TEXT NOT NULL,
             notes TEXT,
             created_at TEXT NOT NULL
-        )"
+        )",
     )
     .execute(&pool)
     .await?;
@@ -276,7 +362,7 @@ async fn init_db() -> Result<SqlitePool, sqlx::Error> {
             resto_id INTEGER NOT NULL,
             timestamp TEXT NOT NULL,
             synced INTEGER DEFAULT 0
-        )"
+        )",
     )
     .execute(&pool)
     .await?;
@@ -285,7 +371,7 @@ async fn init_db() -> Result<SqlitePool, sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS sync_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        )"
+        )",
     )
     .execute(&pool)
     .await?;
@@ -293,10 +379,15 @@ async fn init_db() -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+// ===== MAIN =====
+
 #[tokio::main]
 async fn main() {
+    // Initialize tracing if you want logs
+    // tracing_subscriber::fmt::init();
+
     let db = init_db().await.expect("Failed to initialize database");
-    
+
     let state = Arc::new(AppState {
         db,
         main_server_url: "http://localhost:8000".to_string(),
@@ -309,14 +400,15 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        // Health & Status
         .route("/health", get(health_check))
         .route("/sync/status", get(sync_status))
-        // Proxy endpoints (same interface as main server)
         .route("/list", get(list_restos))
         .route("/add", post(add_resto))
         .route("/remove/:id", delete(remove_resto))
-        .route("/search", post(search_resto))
+        // --- ROUTES UPDATED HERE ---
+        .route("/delete_batch", post(proxy_delete_batch)) // NEW
+        .route("/search", post(search_resto)) // CHANGED to POST
+        .route("/optimize_cuts", post(proxy_optimize_cuts))
         .layer(cors)
         .with_state(state);
 
@@ -326,7 +418,6 @@ async fn main() {
 
     println!("🔄 Proxy Service running on http://0.0.0.0:8001");
     println!("   Main server: http://localhost:8000");
-    println!("   Health check: http://localhost:8001/health");
 
     axum::serve(listener, app)
         .await

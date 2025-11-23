@@ -1,6 +1,8 @@
 use crate::{AppError, AppState, Leftover, MAX_DIMENSION, MAX_THICKNESS};
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 // ===== CUTTING OPTIMIZER STRUCTURES =====
 
@@ -54,12 +56,13 @@ pub struct UsedPlank {
 
 #[derive(Serialize)]
 pub struct OptimizeCutsResponse {
-    pub success: bool,
-    pub used_planks: Vec<UsedPlank>,
-    pub unplaced_cuts: Vec<(usize, CutRequest)>,
+pub success: bool,
     pub efficiency_percent: f64,
     pub total_cuts_placed: usize,
     pub total_cuts_requested: usize,
+    
+    pub used_planks: Vec<UsedPlank>, 
+    pub unplaced_cuts: Vec<(usize, CutRequest)>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,7 +81,7 @@ pub async fn optimize_cuts(
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(cuts = %req.cuts.len(), "Optimizing cuts");
     
-    // Expand cuts by quantity
+    // 1. Expand cuts by quantity
     let mut all_cuts = Vec::new();
     for (idx, cut_req) in req.cuts.iter().enumerate() {
         // Validate dimensions
@@ -100,15 +103,24 @@ pub async fn optimize_cuts(
         }
     }
     
-    // Sort cuts by area descending (Best-Fit Decreasing)
+    // 2. Sort cuts by area descending (Best-Fit Decreasing)
+    // Essential for packing large items like P1/P2 first
     all_cuts.sort_by(|a, b| {
         let area_a = a.1.width_mm * a.1.height_mm;
         let area_b = b.1.width_mm * b.1.height_mm;
-        area_b.cmp(&area_a)
+        // Primary sort: Area
+        match area_b.cmp(&area_a) {
+            Ordering::Equal => {
+                // Secondary sort: Max dimension (prefer long skinny pieces if areas are equal)
+                let max_dim_a = a.1.width_mm.max(a.1.height_mm);
+                let max_dim_b = b.1.width_mm.max(b.1.height_mm);
+                max_dim_b.cmp(&max_dim_a)
+            }
+            other => other,
+        }
     });
     
-    // Get available inventory - sort by area DESCENDING so we try bigger planks first
-    // This helps consolidate cuts onto fewer planks
+    // 3. Get available inventory - Sort by area DESC so we try bigger planks first
     let inventory = sqlx::query_as::<_, Leftover>("SELECT * FROM leftovers WHERE width_mm >= 10 AND height_mm >= 10 ORDER BY width_mm * height_mm DESC")
         .fetch_all(&state.db)
         .await
@@ -118,7 +130,6 @@ pub async fn optimize_cuts(
     let mut unplaced_cuts: Vec<(usize, CutRequest)> = Vec::new();
     
     // Group inventory by (material, thickness)
-    use std::collections::HashMap;
     let mut plank_pools: HashMap<(String, i64), Vec<(Leftover, Vec<FreeRect>)>> = HashMap::new();
     
     for plank in inventory.into_iter() {
@@ -127,7 +138,7 @@ pub async fn optimize_cuts(
         plank_pools.entry(key).or_insert_with(Vec::new).push((plank, free_rects));
     }
     
-    // Try to place each cut
+    // 4. Main Placement Loop
     for (orig_idx, cut) in all_cuts {
         let key = (cut.material.to_lowercase(), cut.thickness_mm);
         
@@ -142,18 +153,17 @@ pub async fn optimize_cuts(
         if let Some(planks) = plank_pools.get_mut(&key) {
             let mut placed = false;
             
-            // Sort planks: prioritize those already in use (have cuts placed) 
-            // First check: is this plank already being used?
-            // Second check: bigger planks first
+            // Sort planks: prioritize those ALREADY used to reduce total planks needed
             planks.sort_by(|(plank_a, _), (plank_b, _)| {
                 let a_used = used_planks.iter().any(|p| p.resto_id == plank_a.id);
                 let b_used = used_planks.iter().any(|p| p.resto_id == plank_b.id);
                 
                 match (a_used, b_used) {
-                    (true, false) => std::cmp::Ordering::Less,    // A is used, comes first
-                    (false, true) => std::cmp::Ordering::Greater, // B is used, comes first
+                    (true, false) => Ordering::Less,    // A is used, prioritize it
+                    (false, true) => Ordering::Greater, // B is used, prioritize it
                     _ => {
-                        // Both used or both unused, sort by area descending
+                        // If both used or both unused, pick the one that fits best (smallest area that fits)
+                        // Or stick to largest area first. Here we stick to largest area (descending).
                         let area_a = plank_a.width_mm * plank_a.height_mm;
                         let area_b = plank_b.width_mm * plank_b.height_mm;
                         area_b.cmp(&area_a)
@@ -161,108 +171,145 @@ pub async fn optimize_cuts(
                 }
             });
             
-            tracing::debug!(
-                available_planks = planks.len(),
-                "Sorted planks for placement"
-            );
-            
             // Try each plank in the pool
             for (plank, free_rects) in planks.iter_mut() {
-                tracing::debug!(
-                    plank_id = plank.id,
-                    plank_dims = format!("{}x{}", plank.width_mm, plank.height_mm),
-                    free_rects = free_rects.len(),
-                    "Trying plank"
-                );
+                if free_rects.is_empty() { continue; }
+                
                 // Try both orientations
                 let orientations = [
                     (cut.width_mm, cut.height_mm, false),
                     (cut.height_mm, cut.width_mm, true),
                 ];
                 
+                let mut best_rect_idx: Option<usize> = None;
+                let mut best_waste = i64::MAX;
+                let mut chosen_orientation = (0, 0, false);
+                
+                // Find Best-Fit Rectangle
                 for (w, h, rotated) in orientations {
-                    // Find best-fit rectangle
-                    let mut best_rect_idx: Option<usize> = None;
-                    let mut best_waste = i64::MAX;
-                    
                     for (i, rect) in free_rects.iter().enumerate() {
                         if rect.width >= w && rect.height >= h {
+                            // "Best Fit" = Minimize leftover area in this specific rectangle
+                            // This keeps large open spaces available in other rectangles
                             let waste = (rect.width * rect.height) - (w * h);
                             if waste < best_waste {
                                 best_waste = waste;
                                 best_rect_idx = Some(i);
+                                chosen_orientation = (w, h, rotated);
                             }
                         }
                     }
-                    
-                    if let Some(rect_idx) = best_rect_idx {
-                        let rect = free_rects.remove(rect_idx);
-                        
-                        let placed_cut = PlacedCut {
-                            original_index: orig_idx,
-                            x: rect.x,
-                            y: rect.y,
-                            width: w,
-                            height: h,
-                            rotated,
-                            material: cut.material.clone(),
-                            thickness_mm: cut.thickness_mm,
-                        };
-                        
-                        // Split the rectangle (Guillotine)
-                        let right_rect = FreeRect {
-                            x: rect.x + w + req.kerf_width_mm,
-                            y: rect.y,
-                            width: rect.width.saturating_sub(w + req.kerf_width_mm),
-                            height: h,
-                        };
-                        
-                        let bottom_rect = FreeRect {
-                            x: rect.x,
-                            y: rect.y + h + req.kerf_width_mm,
-                            width: rect.width,
-                            height: rect.height.saturating_sub(h + req.kerf_width_mm),
-                        };
-                        
-                        if right_rect.width >= req.min_remainder_width_mm && right_rect.height >= req.min_remainder_height_mm {
-                            free_rects.push(right_rect);
-                        }
-                        if bottom_rect.width >= req.min_remainder_width_mm && bottom_rect.height >= req.min_remainder_height_mm {
-                            free_rects.push(bottom_rect);
-                        }
-                        
-                        // Add to used planks
-                        if let Some(plank_entry) = used_planks.iter_mut().find(|p| p.resto_id == plank.id) {
-                            plank_entry.cuts.push(placed_cut);
-                            tracing::debug!(
-                                plank_id = plank.id,
-                                total_cuts = plank_entry.cuts.len(),
-                                "Added cut to existing plank"
-                            );
-                        } else {
-                            tracing::debug!(
-                                plank_id = plank.id,
-                                "Opening new plank"
-                            );
-                            used_planks.push(UsedPlank {
-                                resto_id: plank.id,
-                                width_mm: plank.width_mm,
-                                height_mm: plank.height_mm,
-                                thickness_mm: plank.thickness_mm,
-                                material: plank.material.clone(),
-                                cuts: vec![placed_cut],
-                                waste_percent: 0.0,
-                                total_area_mm2: plank.width_mm * plank.height_mm,
-                                used_area_mm2: 0,
-                            });
-                        }
-                        
-                        placed = true;
-                        break;
-                    }
                 }
                 
-                if placed {
+                // If we found a valid spot
+                if let Some(rect_idx) = best_rect_idx {
+                    let (w, h, rotated) = chosen_orientation;
+                    
+                    // Remove the space we are using
+                    let rect = free_rects.remove(rect_idx);
+                    
+                    tracing::debug!(
+                        plank_id = plank.id,
+                        cut_idx = orig_idx,
+                        position = format!("({}, {})", rect.x, rect.y),
+                        size = format!("{}x{}", w, h),
+                        "Placing cut on plank"
+                    );
+                    
+                    let placed_cut = PlacedCut {
+                        original_index: orig_idx,
+                        x: rect.x,
+                        y: rect.y,
+                        width: w,
+                        height: h,
+                        rotated,
+                        material: cut.material.clone(),
+                        thickness_mm: cut.thickness_mm,
+                    };
+
+                    // =====================================================
+                    // GUILLOTINE SPLIT HEURISTIC (THE FIX)
+                    // =====================================================
+                    let kerf = req.kerf_width_mm;
+                    let remain_w = rect.width.saturating_sub(w + kerf);
+                    let remain_h = rect.height.saturating_sub(h + kerf);
+                    
+                    // Calculate area of the "primary" leftover for both split types
+                    // Horizontal Split: Bottom piece is full width
+                    let bottom_area_h_split = rect.width * remain_h;
+                    
+                    // Vertical Split: Right piece is full height
+                    let right_area_v_split = remain_w * rect.height;
+                    
+                    // Heuristic: Maximizing the Single Largest Area (SLA)
+                    // This reduces fragmentation.
+                    let (new_right, new_bottom) = if bottom_area_h_split >= right_area_v_split {
+                        // Horizontal Split wins (Cut extends right)
+                        // Creates a long strip at the bottom (good for your P4/P6 pieces)
+                        (
+                            FreeRect { 
+                                x: rect.x + w + kerf, 
+                                y: rect.y, 
+                                width: remain_w, 
+                                height: h 
+                            },
+                            FreeRect { 
+                                x: rect.x, 
+                                y: rect.y + h + kerf, 
+                                width: rect.width, // Full width
+                                height: remain_h 
+                            }
+                        )
+                    } else {
+                        // Vertical Split wins (Cut extends down)
+                        // Creates a tall strip on the right
+                        (
+                            FreeRect { 
+                                x: rect.x + w + kerf, 
+                                y: rect.y, 
+                                width: remain_w, 
+                                height: rect.height // Full height
+                            },
+                            FreeRect { 
+                                x: rect.x, 
+                                y: rect.y + h + kerf, 
+                                width: w, 
+                                height: remain_h 
+                            }
+                        )
+                    };
+
+                    // Add valid remainders back to the pool
+                    // Using 30mm as a safety minimum, but you can lower this if needed
+                    let min_useful_size = 30; 
+
+                    if new_right.width >= min_useful_size && new_right.height >= min_useful_size {
+                        free_rects.push(new_right);
+                    }
+                    
+                    if new_bottom.width >= min_useful_size && new_bottom.height >= min_useful_size {
+                        free_rects.push(new_bottom);
+                    }
+                    // =====================================================
+
+                    // Add to used planks list
+                    if let Some(plank_entry) = used_planks.iter_mut().find(|p| p.resto_id == plank.id) {
+                        plank_entry.cuts.push(placed_cut);
+                    } else {
+                        used_planks.push(UsedPlank {
+                            resto_id: plank.id,
+                            width_mm: plank.width_mm,
+                            height_mm: plank.height_mm,
+                            thickness_mm: plank.thickness_mm,
+                            material: plank.material.clone(),
+                            cuts: vec![placed_cut],
+                            waste_percent: 0.0,
+                            total_area_mm2: plank.width_mm * plank.height_mm,
+                            used_area_mm2: 0,
+                        });
+                    }
+                    
+                    placed = true;
                     break;
                 }
             }
@@ -275,13 +322,15 @@ pub async fn optimize_cuts(
         }
     }
     
-    // Update stats for each plank
+    // 5. Calculate Stats
     for plank in &mut used_planks {
         let total = plank.total_area_mm2;
         let mut used = 0i64;
         
         for cut in &plank.cuts {
             used += cut.width * cut.height;
+            // Optional: You can consider kerf "used" or "waste" depending on preference.
+            // Here we count kerf as used area to be fair to the efficiency score.
             used += (cut.width + cut.height) * req.kerf_width_mm;
         }
         
@@ -293,7 +342,6 @@ pub async fn optimize_cuts(
         };
     }
     
-    // Calculate efficiency
     let total_cuts_placed = req.cuts.iter().map(|c| c.quantity as usize).sum::<usize>() - unplaced_cuts.len();
     let total_area_used: i64 = used_planks.iter().map(|p| p.used_area_mm2).sum();
     let total_area_available: i64 = used_planks.iter().map(|p| p.total_area_mm2).sum();

@@ -414,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ready", get(readiness_check))
         .route("/add", post(add_resto))
         .route("/remove/:id", delete(remove_resto))
+        .route("/delete_batch", post(delete_batch))
         .route("/update/:id", post(update_resto))
         .route("/search", get(search_resto))
         .route("/list", get(list_restos))
@@ -510,6 +511,35 @@ async fn remove_resto(
 
     tracing::info!(id = id, "Removed resto");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct DeleteBatchRequest {
+    ids: Vec<i64>,
+}
+
+async fn delete_batch(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteBatchRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.ids.is_empty() {
+        return Ok(Json("No IDs provided".to_string()));
+    }
+
+    let query = format!(
+        "DELETE FROM leftovers WHERE id IN ({})",
+        req.ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+    );
+
+    let mut q = sqlx::query(&query);
+    for id in req.ids {
+        q = q.bind(id);
+    }
+
+    let result = q.execute(&state.db).await.map_err(AppError::Database)?;
+    
+    tracing::info!("Batch deleted {} records", result.rows_affected());
+    Ok(Json(format!("Deleted {} records", result.rows_affected())))
 }
 
 // TODO: Maybe not a full depth search, what if the worker just wants all the restos from material X and thickness Y?

@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, optimizeCuts as optimizeCutsAPI, getServerUrl, setServerUrl } from "./api";
 import VanVisualization from "./VanVisualization";
+import { invoke } from "@tauri-apps/api/core";
 
 async function optimizeCuts(cuttingList, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
   
-  // Transform cuttingList to API format
   const cuts = cuttingList.map(cut => ({
     width_mm: parseInt(cut.width_mm),
     height_mm: parseInt(cut.height_mm),
@@ -17,17 +17,14 @@ async function optimizeCuts(cuttingList, settings) {
   
   console.log('Sending cuts to API:', cuts);
   
-  // Call backend API
   const response = await optimizeCutsAPI(cuts, kerfWidth, minRemainderWidth, minRemainderHeight);
   
   console.log('Received response from API:', response);
   
-  // Check if response is valid
   if (!response || !response.used_planks) {
     throw new Error('Invalid response from server');
   }
   
-  // Transform response to match old format for UI compatibility
   return {
     usedPlanks: response.used_planks.map(plank => ({
       resto: {
@@ -227,7 +224,7 @@ function App() {
     }
   }
 
-  async function fetchEstado() {
+async function fetchEstado() {
     const newEstado = {
       mainServer: { status: 'error', uptime: 0 },
       proxyServer: { status: 'error', uptime: 0, db: '', pending: 0 },
@@ -235,22 +232,28 @@ function App() {
     };
 
     try {
-      const response = await fetch('http://localhost:8000/health');
-      if (response.ok) {
-        const data = await response.json();
-        newEstado.mainServer.status = data.status === 'ok' ? 'ok' : 'error';
-      }
+      const isOnline = await invoke('check_api_status', { 
+        url: 'https://api.faky.dev' 
+      });
+      
+      newEstado.mainServer.status = isOnline ? 'ok' : 'error';
+      
     } catch (e) {
       console.error('Main server health check failed:', e);
+      newEstado.mainServer.status = 'error';
     }
 
     try {
       const healthRes = await fetch('http://localhost:8001/health');
       if (healthRes.ok) {
         const health = await healthRes.json();
-        newEstado.proxyServer.status = health.proxy_active ? 'ok' : 'error';
+        newEstado.proxyServer.status = 'ok'; 
         newEstado.proxyServer.uptime = health.uptime_seconds || 0;
         newEstado.proxyServer.db = health.db_path || '';
+        
+        if (!health.main_server_active && newEstado.mainServer.status === 'ok') {
+             // Opcional: decidir em quem confiar mais (Rust direto ou Proxy)
+        }
       }
 
       const syncRes = await fetch('http://localhost:8001/sync/status');
@@ -260,10 +263,11 @@ function App() {
       }
     } catch (e) {
       console.error('Proxy server health check failed:', e);
+      newEstado.proxyServer.status = 'error';
     }
 
     setEstadoData(newEstado);
-  }
+}
 
   async function refresh() {
     try {

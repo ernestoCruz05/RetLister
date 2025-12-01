@@ -1014,7 +1014,7 @@ async fn delete_van(
 // ===== 3D BIN PACKING ALGORITHM =====
 
 /// Represents a placed box in the van for support checking
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PlacedBox {
     x: i64,
     y: i64,
@@ -1027,6 +1027,21 @@ struct PlacedBox {
 }
 
 impl PlacedBox {
+    /// Check if this box provides support at the given position and dimensions
+    fn supports(&self, x: i64, z: i64, length: i64, width: i64, at_y: i64) -> bool {
+        // The top of this box should be exactly at at_y
+        let my_top = self.y + self.height;
+        if my_top != at_y {
+            return false;
+        }
+
+        // Check horizontal overlap (item must be within the footprint of this box)
+        let x_overlap = (x < self.x + self.length) && (x + length > self.x);
+        let z_overlap = (z < self.z + self.width) && (z + width > self.z);
+
+        x_overlap && z_overlap
+    }
+
     /// Calculate the percentage of the item's base that is supported by this box
     fn support_percentage(&self, x: i64, z: i64, length: i64, width: i64, at_y: i64) -> f64 {
         let my_top = self.y + self.height;
@@ -1048,6 +1063,30 @@ impl PlacedBox {
         let item_area = length * width;
 
         overlap_area as f64 / item_area as f64
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FreeSpace {
+    x: i64,
+    y: i64,
+    z: i64,
+    length: i64,
+    width: i64,
+    height: i64,
+}
+
+impl FreeSpace {
+    fn volume(&self) -> i64 {
+        self.length * self.width * self.height
+    }
+
+    fn can_fit(&self, item_l: i64, item_w: i64, item_h: i64) -> bool {
+        item_l <= self.length && item_w <= self.width && item_h <= self.height
+    }
+
+    fn is_on_floor(&self) -> bool {
+        self.y == 0
     }
 }
 
@@ -1116,7 +1155,7 @@ fn is_in_wheel_well(
 }
 
 /// Check if an item has adequate support at the given position
-/// Returns (is_supported, support_percentage)
+/// Returns (is_supported, support_percentage, can_support_weight)
 fn check_support(
     placed_boxes: &[PlacedBox],
     x: i64,
@@ -1125,7 +1164,7 @@ fn check_support(
     length: i64,
     width: i64,
     weight_kg: f64,
-    _item_fragile: bool,
+    item_fragile: bool,
 ) -> (bool, f64) {
     // Items on the floor are always supported
     if y == 0 {
@@ -1169,25 +1208,12 @@ fn pack_items_3d(
     // Get wheel well dimensions
     let wheel_width = van.wheel_well_width_mm.unwrap_or(0);
     let wheel_height = van.wheel_well_height_mm.unwrap_or(0);
-    let _wheel_start_x = van.wheel_well_start_x_mm.unwrap_or(van.length_mm);
 
-    // Sort items: largest volume first, fragile last
-    let mut sorted_items: Vec<(usize, &CargoItem)> = items.iter().enumerate().collect();
-    sorted_items.sort_by(|a, b| {
-        // Fragile items go LAST (placed near door for easy access)
-        match (a.1.fragile, b.1.fragile) {
-            (false, true) => return std::cmp::Ordering::Less,
-            (true, false) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
-        // Largest volume first
-        let vol_a = a.1.length_mm * a.1.width_mm * a.1.height_mm;
-        let vol_b = b.1.length_mm * b.1.width_mm * b.1.height_mm;
-        vol_b.cmp(&vol_a)
-    });
+    // Note: Items should already be sorted by Footprint Area (Length * Width) descending
+    // in the calling function (optimize_loading) before being passed here.
 
-    for (_idx, item) in sorted_items {
-        // Generate all valid orientations for this item
+    for (_idx, item) in items.iter().enumerate() {
+        // 1. Generate Orientations
         let mut orientations: Vec<(i64, i64, i64)> = Vec::new();
 
         if item.rotation_allowed {
@@ -1208,12 +1234,12 @@ fn pack_items_3d(
                 }
             }
 
-            // Prefer lower height (more stable), then larger footprint
+            // Prefer orientations with lower Center of Gravity (lowest height), then largest footprint
             orientations.sort_by(|a, b| {
                 if a.2 != b.2 {
-                    return a.2.cmp(&b.2);
+                    return a.2.cmp(&b.2); // Ascending height (stable base)
                 }
-                (b.0 * b.1).cmp(&(a.0 * a.1))
+                (b.0 * b.1).cmp(&(a.0 * a.1)) // Descending area
             });
         } else {
             if item.height_mm <= van.height_mm {
@@ -1223,90 +1249,42 @@ fn pack_items_3d(
 
         if orientations.is_empty() {
             warnings.push(format!(
-                "Item '{}' ({}×{}×{}mm) cannot fit in van",
+                "Item '{}' ({}x{}x{}mm) cannot fit in van",
                 item.description, item.length_mm, item.width_mm, item.height_mm
             ));
             continue;
         }
 
-        // Generate ALL candidate positions using Extreme Points method
-        // Start with corners of the empty space
+        // 2. Generate Candidate Positions (Extreme Points)
         let mut candidate_positions: Vec<(i64, i64, i64)> = Vec::new();
 
-        // Origin point
+        // Origin
         candidate_positions.push((0, 0, 0));
 
-        // Points that avoid wheel wells (if wheel wells exist)
+        // Wheel Well avoids
         if wheel_width > 0 && wheel_height > 0 {
-            // Start after left wheel well
             candidate_positions.push((0, 0, wheel_width));
-            // Start before right wheel well  
             candidate_positions.push((0, 0, van.width_mm - wheel_width));
-            // Above wheel wells
             candidate_positions.push((0, wheel_height, 0));
         }
 
-        // === TIGHT PACKING CANDIDATE GENERATION ===
-        // For each placed box, generate positions that would place new items
-        // DIRECTLY against that box (zero gap)
-        
+        // Relative to placed boxes
         for placed in &placed_boxes {
-            // === POSITIONS DIRECTLY AFTER THIS BOX IN X (touching its front face) ===
-            // Try all Z positions along this box's width
-            candidate_positions.push((placed.x + placed.length, 0, placed.z));
-            candidate_positions.push((placed.x + placed.length, 0, 0));
-            candidate_positions.push((placed.x + placed.length, 0, wheel_width));
-            candidate_positions.push((placed.x + placed.length, placed.y, placed.z));
-            
-            // === POSITIONS DIRECTLY BESIDE THIS BOX IN Z (touching its side) ===
-            // Right side of placed box
-            candidate_positions.push((placed.x, 0, placed.z + placed.width));
-            candidate_positions.push((0, 0, placed.z + placed.width));
-            candidate_positions.push((placed.x, placed.y, placed.z + placed.width));
-            
-            // Left side of placed box (for items that would end at placed.z)
-            if placed.z > 0 {
-                candidate_positions.push((placed.x, 0, 0)); // Start at left wall
-                candidate_positions.push((0, 0, 0));
-            }
-            
-            // === POSITIONS ON TOP OF THIS BOX ===
+            // X-axis neighbors (Front/Back)
+            candidate_positions.push((placed.x + placed.length, 0, placed.z)); // Behind item on floor
+            candidate_positions.push((placed.x + placed.length, placed.y, placed.z)); // Behind item at same level
+
+            // Z-axis neighbors (Side-by-side)
+            candidate_positions.push((placed.x, 0, placed.z + placed.width)); // Beside item on floor
+            candidate_positions.push((placed.x, placed.y, placed.z + placed.width)); // Beside item at same level
+
+            // Stacking (On top)
             if placed.stackable {
                 candidate_positions.push((placed.x, placed.y + placed.height, placed.z));
-                candidate_positions.push((placed.x, placed.y + placed.height, 0));
-                candidate_positions.push((0, placed.y + placed.height, placed.z));
-                candidate_positions.push((0, placed.y + placed.height, 0));
             }
-            
-            // === POSITIONS THAT FILL GAPS BETWEEN BOXES ===
-            // For each OTHER placed box, find positions between them
-            for other in &placed_boxes {
-                if placed.x == other.x && placed.y == other.y {
-                    continue; // Same box
-                }
-                
-                // If there's a gap between boxes in X direction
-                if other.x > placed.x + placed.length {
-                    candidate_positions.push((placed.x + placed.length, 0, placed.z));
-                    candidate_positions.push((placed.x + placed.length, 0, other.z));
-                }
-                
-                // If there's a gap between boxes in Z direction
-                if other.z > placed.z + placed.width && placed.x < other.x + other.length && placed.x + placed.length > other.x {
-                    candidate_positions.push((placed.x, 0, placed.z + placed.width));
-                }
-            }
-        }
-        
-        // === WALL-ALIGNED POSITIONS ===
-        // Right wall positions (items ending at van.width_mm)
-        candidate_positions.push((0, 0, van.width_mm)); // Will be adjusted when checking orientations
-        for placed in &placed_boxes {
-            candidate_positions.push((placed.x + placed.length, 0, van.width_mm));
-            candidate_positions.push((placed.x, 0, van.width_mm));
         }
 
-        // Remove duplicates and filter valid positions
+        // De-duplicate and bounds check candidates strictly
         candidate_positions.sort();
         candidate_positions.dedup();
         candidate_positions.retain(|(x, y, z)| {
@@ -1317,54 +1295,11 @@ fn pack_items_3d(
                 && *y < van.height_mm
                 && *z < van.width_mm
         });
-        
-        // === ALSO TRY RIGHT-WALL-ALIGNED POSITIONS ===
-        // For each orientation, we'll also try placing items so their RIGHT edge touches the right wall
-        // This is handled in the scoring loop below
 
         let mut best_position: Option<(i64, i64, i64, i64, i64, i64)> = None;
         let mut best_score = i64::MIN;
-        
-        // Also generate right-wall-aligned positions for each orientation
-        for (_l, w, _h) in &orientations {
-            // Position where item's right edge touches right wall
-            let right_wall_z = van.width_mm - w;
-            if right_wall_z >= 0 {
-                candidate_positions.push((0, 0, right_wall_z));
-                for placed in &placed_boxes {
-                    candidate_positions.push((placed.x + placed.length, 0, right_wall_z));
-                    if placed.stackable {
-                        candidate_positions.push((placed.x, placed.y + placed.height, right_wall_z));
-                    }
-                }
-            }
-            
-            // Position where item fits exactly between left wall/wheel well and a placed box
-            for placed in &placed_boxes {
-                // Fit between wheel well and this box
-                if placed.z >= wheel_width + w {
-                    candidate_positions.push((placed.x, 0, placed.z - w));
-                    candidate_positions.push((0, 0, placed.z - w));
-                }
-                // Fit between this box's right side and the right wall
-                if placed.z + placed.width + w <= van.width_mm {
-                    candidate_positions.push((placed.x, 0, placed.z + placed.width));
-                }
-            }
-        }
-        
-        // De-duplicate again after adding orientation-specific positions
-        candidate_positions.sort();
-        candidate_positions.dedup();
-        candidate_positions.retain(|(x, y, z)| {
-            *x >= 0
-                && *y >= 0
-                && *z >= 0
-                && *x < van.length_mm
-                && *y < van.height_mm
-                && *z < van.width_mm
-        });
 
+        // 3. Find Best Position
         for (cx, cy, cz) in &candidate_positions {
             for (l, w, h) in &orientations {
                 let x = *cx;
@@ -1393,114 +1328,100 @@ fn pack_items_3d(
                     continue;
                 }
 
-                // Check support (items above floor need support)
+                // Check support
                 let (is_supported, _support_pct) =
                     check_support(&placed_boxes, x, y, z, *l, *w, item.weight_kg, item.fragile);
                 if !is_supported {
                     continue;
                 }
 
-                // === SCORING: FLOOR-FIRST, TIGHT PACKING ===
-                // Priority: 1) Stay on floor, 2) Fill gaps, 3) Only stack when necessary
                 let mut score: i64 = 0;
 
-                // === MASSIVE HEIGHT PENALTY ===
-                // This is the key: stacking should be a LAST RESORT
-                // Each mm of height costs points - a box at y=600 loses 60,000,000 points!
-                score -= y * 100_000;
+                // 1. BASIC PHYSICS (The "Wall Builder" Baseline)
+                score -= x * 4_000; // Minimize Depth (Primary)
+                score -= y * 1_000; // Minimize Height (Secondary)
+                score -= z * 200; // Minimize Width (Tertiary)
 
-                // 1. FLOOR BONUS - Extremely strong preference for floor
+                // 2. ANCHOR BONUSES
                 if y == 0 {
-                    score += 50_000_000;
-                }
-
-                // 2. BACK OF VAN BONUS (lower X = better, pack from back)
-                // Max bonus at x=0, decreasing as we move toward door
-                score += (van.length_mm - x) * 1000;
-
-                // 3. WALL CONTACT BONUSES
-                // Back wall (x = 0)
+                    score += 100_000;
+                } // Tie-breaker for floor
                 if x == 0 {
-                    score += 5_000_000;
-                }
-                // Left wall (z = 0) - above wheel wells or no wheel wells
-                if z == 0 && (y >= wheel_height || wheel_height == 0) {
-                    score += 3_000_000;
-                }
-                // Right wall (z + width = van.width_mm)
-                if z + w == van.width_mm {
-                    score += 3_000_000;
-                }
-                // After wheel well position
-                if z == wheel_width && wheel_width > 0 && y < wheel_height {
                     score += 2_000_000;
-                }
+                } // Back wall is critical
+                if z == 0 {
+                    score += 1_000_000;
+                } // Left wall anchor
 
-                // 4. TIGHT PACKING - Contact with other items
-                let mut contact_surfaces = 0;
-                let mut total_contact_area: i64 = 0;
-                
+                // 3. PROFESSIONAL ALIGNMENT (The "Tetris" Logic)
+                // This makes the load look neat and organized by rewarding flush edges.
+
+                let mut contact_count = 0;
+                let mut contact_area: i64 = 0;
+                let mut alignment_bonus: i64 = 0;
+
                 for placed in &placed_boxes {
-                    let touching_x_front = x == placed.x + placed.length;
-                    let touching_x_back = x + l == placed.x;
-                    let x_overlap = x < placed.x + placed.length && x + l > placed.x;
-                    
-                    let touching_z_left = z == placed.z + placed.width;
-                    let touching_z_right = z + w == placed.z;
-                    let z_overlap = z < placed.z + placed.width && z + w > placed.z;
-                    
-                    let touching_y_top = y == placed.y + placed.height;
-                    let y_overlap = y < placed.y + placed.height && y + h > placed.y;
+                    let touching_x = x == placed.x + placed.length || x + l == placed.x;
+                    let touching_z = z == placed.z + placed.width || z + w == placed.z;
+                    let touching_y = y == placed.y + placed.height || y + h == placed.y;
 
-                    // X-axis contact (front/back faces touching)
-                    if (touching_x_front || touching_x_back) && z_overlap && y_overlap {
-                        contact_surfaces += 1;
-                        let z_contact = (z + w).min(placed.z + placed.width) - z.max(placed.z);
-                        let y_contact = (y + h).min(placed.y + placed.height) - y.max(placed.y);
-                        total_contact_area += z_contact * y_contact;
+                    let overlaps_x = x < placed.x + placed.length && x + l > placed.x;
+                    let overlaps_z = z < placed.z + placed.width && z + w > placed.z;
+                    let overlaps_y = y < placed.y + placed.height && y + h > placed.y;
+
+                    // --- CHECK Z-NEIGHBORS (Side-by-Side) ---
+                    if touching_z && overlaps_x && overlaps_y {
+                        contact_count += 1;
+                        let x_ov = (x + l).min(placed.x + placed.length) - x.max(placed.x);
+                        let y_ov = (y + h).min(placed.y + placed.height) - y.max(placed.y);
+                        contact_area += x_ov * y_ov;
+
+                        // BONUS: SHELF BUILDER
+                        // If heights match, we create a flat top for the next layer.
+                        if (h - placed.height).abs() < 5 {
+                            alignment_bonus += 3_000_000;
+                        }
+
+                        // BONUS: FLAT FACE BUILDER
+                        // If lengths match (or fronts align), we create a flat wall for the next row.
+                        if (x + l - (placed.x + placed.length)).abs() < 5 {
+                            alignment_bonus += 2_000_000;
+                        }
                     }
-                    // Z-axis contact (side faces touching)
-                    if (touching_z_left || touching_z_right) && x_overlap && y_overlap {
-                        contact_surfaces += 1;
-                        let x_contact = (x + l).min(placed.x + placed.length) - x.max(placed.x);
-                        let y_contact = (y + h).min(placed.y + placed.height) - y.max(placed.y);
-                        total_contact_area += x_contact * y_contact;
+
+                    // --- CHECK Y-NEIGHBORS (Stacked) ---
+                    if touching_y && overlaps_x && overlaps_z {
+                        contact_count += 1;
+                        let x_ov = (x + l).min(placed.x + placed.length) - x.max(placed.x);
+                        let z_ov = (z + w).min(placed.z + placed.width) - z.max(placed.z);
+                        contact_area += x_ov * z_ov;
+
+                        // BONUS: PERFECT STACK
+                        // If footprints match, it's structurally superior.
+                        if (l - placed.length).abs() < 5 && (w - placed.width).abs() < 5 {
+                            alignment_bonus += 5_000_000;
+                        }
                     }
-                    // Y-axis contact (sitting on top)
-                    if touching_y_top && x_overlap && z_overlap {
-                        contact_surfaces += 1;
-                        let x_contact = (x + l).min(placed.x + placed.length) - x.max(placed.x);
-                        let z_contact = (z + w).min(placed.z + placed.width) - z.max(placed.z);
-                        total_contact_area += x_contact * z_contact;
+
+                    // --- CHECK X-NEIGHBORS (Front/Back) ---
+                    if touching_x && overlaps_z && overlaps_y {
+                        contact_count += 1;
+                        let z_ov = (z + w).min(placed.z + placed.width) - z.max(placed.z);
+                        let y_ov = (y + h).min(placed.y + placed.height) - y.max(placed.y);
+                        contact_area += z_ov * y_ov;
+
+                        // BONUS: ROW CONTINUITY
+                        // If widths match, we are continuing a "column".
+                        if (w - placed.width).abs() < 5 {
+                            alignment_bonus += 1_000_000;
+                        }
                     }
                 }
 
-                // Contact bonus - but not enough to overcome height penalty
-                score += contact_surfaces as i64 * 1_000_000;
-                score += total_contact_area / 50;
-
-                // 5. CORNER BONUS (only on floor)
-                if y == 0 {
-                    let at_back = x == 0;
-                    let at_left = z == 0 || z == wheel_width;
-                    let at_right = z + w == van.width_mm;
-                    
-                    if at_back && at_left {
-                        score += 8_000_000; // Best corner
-                    } else if at_back && at_right {
-                        score += 6_000_000;
-                    } else if at_back {
-                        score += 4_000_000;
-                    } else if at_left || at_right {
-                        score += 2_000_000;
-                    }
-                }
-
-                // 6. PENALIZE GAPS ON FLOOR
-                // If on floor but not touching anything, heavily penalize
-                if y == 0 && x > 0 && contact_surfaces == 0 {
-                    score -= 20_000_000;
-                }
+                // Apply the calculated bonuses
+                score += contact_count as i64 * 1_000_000;
+                score += contact_area / 5;
+                score += alignment_bonus;
 
                 if score > best_score {
                     best_score = score;
@@ -1510,16 +1431,12 @@ fn pack_items_3d(
         }
 
         if let Some((x, y, z, l, w, h)) = best_position {
+            // Check if rotated (simplistic check)
             let rot = if l != item.length_mm || w != item.width_mm || h != item.height_mm {
-                90
+                90 // Just a flag for the UI
             } else {
                 0
             };
-
-            println!(
-                "PLACED: '{}' at ({},{},{}) dims {}x{}x{}",
-                item.description, x, y, z, l, w, h
-            );
 
             positioned.push(PositionedItem {
                 item: item.clone(),
@@ -1539,11 +1456,9 @@ fn pack_items_3d(
                 width: w,
                 height: h,
                 stackable: item.stackable,
-                max_stack_weight: if item.stackable { 100.0 } else { 0.0 },
+                max_stack_weight: if item.stackable { 100.0 } else { 0.0 }, // Simplified weight limit
             });
         }
-        // Note: We don't add warnings for items that couldn't be placed here
-        // They'll be handled in the next trip during multi-trip planning
     }
 
     positioned

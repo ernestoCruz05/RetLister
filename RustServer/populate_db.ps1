@@ -1,6 +1,6 @@
 # Script to populate the database with diverse leftover pieces (retalhos)
 
-$SERVER_URL = "http://localhost:8000"
+$SERVER_URL = "https://api.faky.dev"
 
 # Common materials used in workshops
 $materials = @("MDF", "Contraplacado", "Aglomerado", "OSB", "Melamina", "Madeira Maciça", "Forro", "HDF")

@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, Query, State, Request},
-    http::{StatusCode, HeaderMap},
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -8,14 +8,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, Pool, Sqlite};
-use std::net::SocketAddr;
 use std::fs;
+use std::net::SocketAddr;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -57,18 +57,26 @@ impl IntoResponse for AppError {
         let (status, error, details) = match self {
             AppError::Validation(msg) => {
                 tracing::warn!(error = %msg, "Validation error");
-                (StatusCode::BAD_REQUEST, "Validation error".to_string(), Some(msg))
-            },
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Validation error".to_string(),
+                    Some(msg),
+                )
+            }
             AppError::NotFound(msg) => {
                 tracing::debug!(error = %msg, "Resource not found");
                 (StatusCode::NOT_FOUND, "Not found".to_string(), Some(msg))
-            },
+            }
             AppError::Database(err) => {
                 tracing::error!("Database error: {}", err);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string(), None)
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                    None,
+                )
             }
         };
-        
+
         let body = Json(ErrorResponse { error, details });
         (status, body).into_response()
     }
@@ -76,26 +84,44 @@ impl IntoResponse for AppError {
 
 fn validate_dimensions(width: i64, height: i64, thickness: i64) -> Result<(), AppError> {
     if width < MIN_DIMENSION || width > MAX_DIMENSION {
-        return Err(AppError::Validation(format!("Width must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+        return Err(AppError::Validation(format!(
+            "Width must be between {} and {} mm",
+            MIN_DIMENSION, MAX_DIMENSION
+        )));
     }
     if height < MIN_DIMENSION || height > MAX_DIMENSION {
-        return Err(AppError::Validation(format!("Height must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+        return Err(AppError::Validation(format!(
+            "Height must be between {} and {} mm",
+            MIN_DIMENSION, MAX_DIMENSION
+        )));
     }
     if thickness < MIN_DIMENSION || thickness > MAX_THICKNESS {
-        return Err(AppError::Validation(format!("Thickness must be between {} and {} mm", MIN_DIMENSION, MAX_THICKNESS)));
+        return Err(AppError::Validation(format!(
+            "Thickness must be between {} and {} mm",
+            MIN_DIMENSION, MAX_THICKNESS
+        )));
     }
     Ok(())
 }
 
 fn validate_van_dimensions(length: i64, width: i64, height: i64) -> Result<(), AppError> {
     if length < MIN_DIMENSION || length > MAX_DIMENSION {
-        return Err(AppError::Validation(format!("Length must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+        return Err(AppError::Validation(format!(
+            "Length must be between {} and {} mm",
+            MIN_DIMENSION, MAX_DIMENSION
+        )));
     }
     if width < MIN_DIMENSION || width > MAX_DIMENSION {
-        return Err(AppError::Validation(format!("Width must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+        return Err(AppError::Validation(format!(
+            "Width must be between {} and {} mm",
+            MIN_DIMENSION, MAX_DIMENSION
+        )));
     }
     if height < MIN_DIMENSION || height > MAX_DIMENSION {
-        return Err(AppError::Validation(format!("Height must be between {} and {} mm", MIN_DIMENSION, MAX_DIMENSION)));
+        return Err(AppError::Validation(format!(
+            "Height must be between {} and {} mm",
+            MIN_DIMENSION, MAX_DIMENSION
+        )));
     }
     Ok(())
 }
@@ -103,10 +129,15 @@ fn validate_van_dimensions(length: i64, width: i64, height: i64) -> Result<(), A
 fn validate_material(material: &str) -> Result<(), AppError> {
     let len = material.len();
     if len < MIN_MATERIAL_LEN || len > MAX_MATERIAL_LEN {
-        return Err(AppError::Validation(format!("Material must be between {} and {} characters", MIN_MATERIAL_LEN, MAX_MATERIAL_LEN)));
+        return Err(AppError::Validation(format!(
+            "Material must be between {} and {} characters",
+            MIN_MATERIAL_LEN, MAX_MATERIAL_LEN
+        )));
     }
     if material.trim().is_empty() {
-        return Err(AppError::Validation("Material cannot be empty or whitespace only".to_string()));
+        return Err(AppError::Validation(
+            "Material cannot be empty or whitespace only".to_string(),
+        ));
     }
     Ok(())
 }
@@ -114,7 +145,10 @@ fn validate_material(material: &str) -> Result<(), AppError> {
 fn validate_notes(notes: &Option<String>) -> Result<(), AppError> {
     if let Some(n) = notes {
         if n.len() > MAX_NOTES_LEN {
-            return Err(AppError::Validation(format!("Notes must not exceed {} characters", MAX_NOTES_LEN)));
+            return Err(AppError::Validation(format!(
+                "Notes must not exceed {} characters",
+                MAX_NOTES_LEN
+            )));
         }
     }
     Ok(())
@@ -129,11 +163,9 @@ async fn auth_middleware(
     let Some(required_token) = &state.auth_token else {
         return Ok(next.run(request).await);
     };
-    
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok());
-    
+
+    let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
+
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..]; // Skip "Bearer "
@@ -190,7 +222,7 @@ struct AddLeftoverResponse {
 }
 
 // Van and Cargo structures
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone)]
 struct Van {
     id: i64,
     name: String,
@@ -335,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db_path = std::env::current_dir()?.join("data").join("retlister.db");
     let connection_string = format!("sqlite://{}", db_path.display());
-    
+
     tracing::info!("Connecting to database: {}", connection_string);
 
     let db = SqlitePoolOptions::new()
@@ -347,14 +379,16 @@ async fn main() -> anyhow::Result<()> {
     // Configure SQLite for safety and performance
     sqlx::query("PRAGMA journal_mode=WAL;").execute(&db).await?;
     sqlx::query("PRAGMA foreign_keys=ON;").execute(&db).await?;
-    sqlx::query("PRAGMA busy_timeout=5000;").execute(&db).await?; // 5 second timeout for locks
+    sqlx::query("PRAGMA busy_timeout=5000;")
+        .execute(&db)
+        .await?; // 5 second timeout for locks
 
     // Check database integrity before proceeding
     tracing::info!("Running database integrity check...");
     let integrity_result: (String,) = sqlx::query_as("PRAGMA integrity_check;")
         .fetch_one(&db)
         .await?;
-    
+
     if integrity_result.0 != "ok" {
         tracing::error!("Database integrity check failed: {}", integrity_result.0);
         anyhow::bail!(
@@ -368,20 +402,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Database integrity check passed");
 
     sqlx::migrate!("./Migrations").run(&db).await?;
-    
+
     // Verify schema version
-    let current_version: Option<(i64,)> = sqlx::query_as(
-        "SELECT version FROM schema_metadata ORDER BY version DESC LIMIT 1"
-    )
-    .fetch_optional(&db)
-    .await?;
-    
+    let current_version: Option<(i64,)> =
+        sqlx::query_as("SELECT version FROM schema_metadata ORDER BY version DESC LIMIT 1")
+            .fetch_optional(&db)
+            .await?;
+
     match current_version {
         Some((version,)) => {
             if version != SCHEMA_VERSION {
                 tracing::warn!(
                     "Schema version mismatch: expected {}, found {}. Migrations may be needed.",
-                    SCHEMA_VERSION, version
+                    SCHEMA_VERSION,
+                    version
                 );
             } else {
                 tracing::info!("Schema version {} verified", version);
@@ -389,11 +423,13 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             // First run, insert schema version
-            sqlx::query("INSERT INTO schema_metadata (version, applied_at) VALUES (?1, CURRENT_TIMESTAMP)")
-                .bind(SCHEMA_VERSION)
-                .execute(&db)
-                .await
-                .ok(); // Ignore error if table doesn't exist yet (will be created by migration)
+            sqlx::query(
+                "INSERT INTO schema_metadata (version, applied_at) VALUES (?1, CURRENT_TIMESTAMP)",
+            )
+            .bind(SCHEMA_VERSION)
+            .execute(&db)
+            .await
+            .ok(); // Ignore error if table doesn't exist yet (will be created by migration)
             tracing::info!("Initialized schema version {}", SCHEMA_VERSION);
         }
     }
@@ -410,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Leftover <=> Resto
     let app = Router::new()
-        .route("/health", get(health_check))  // Public endpoint
+        .route("/health", get(health_check)) // Public endpoint
         .route("/ready", get(readiness_check))
         .route("/add", post(add_resto))
         .route("/remove/:id", delete(remove_resto))
@@ -421,19 +457,29 @@ async fn main() -> anyhow::Result<()> {
         .route("/stats", get(get_stats))
         // Van management
         .route("/vans", get(list_vans).post(add_van))
-        .route("/vans/:id", get(get_van).post(update_van).delete(delete_van))
+        .route(
+            "/vans/:id",
+            get(get_van).post(update_van).delete(delete_van),
+        )
         // Optimize loading (cargo items sent in request body)
         .route("/optimize", post(optimize_loading))
         // Optimize cutting (cutting list sent in request body)
         .route("/optimize_cuts", post(optimize_cuts))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))  // Apply auth to all routes above
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        )) // Apply auth to all routes above
         .with_state(state)
         .layer(
             ServiceBuilder::new()
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                        .on_response(DefaultOnResponse::new().level(tracing::Level::INFO).latency_unit(LatencyUnit::Millis))
+                        .on_response(
+                            DefaultOnResponse::new()
+                                .level(tracing::Level::INFO)
+                                .latency_unit(LatencyUnit::Millis),
+                        ),
                 )
                 .layer(TimeoutLayer::new(Duration::from_secs(30))) // 30s request timeout
                 .layer(
@@ -441,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
                         .allow_origin(Any)
                         .allow_methods(Any)
                         .allow_headers(Any),
-                )
+                ),
         );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
@@ -481,7 +527,7 @@ async fn add_resto(
     .map_err(AppError::Database)?;
 
     let id = result.last_insert_rowid();
-    
+
     tracing::info!(
         id = id,
         width = payload.width_mm,
@@ -537,13 +583,13 @@ async fn delete_batch(
     }
 
     let result = q.execute(&state.db).await.map_err(AppError::Database)?;
-    
+
     tracing::info!("Batch deleted {} records", result.rows_affected());
     Ok(Json(format!("Deleted {} records", result.rows_affected())))
 }
 
 // TODO: Maybe not a full depth search, what if the worker just wants all the restos from material X and thickness Y?
-// For now full depth search, but i could see a worker wanting to search my material only and see what thicknesses are available 
+// For now full depth search, but i could see a worker wanting to search my material only and see what thicknesses are available
 // to get an idea of what to cut & available sizes, i should bring this up later
 // TODO: Pagination too, just in case the database gets huge (unlikely but i might enterprise this later)
 // Also TODO: Limit maximum results, might overload the server and the worker with the information
@@ -589,7 +635,10 @@ async fn search_resto(
     );
 
     if candidates.is_empty() {
-        return Err(AppError::NotFound(format!("No matching restos found for material '{}' with dimensions {}x{}x{} mm", params.material, params.width_mm, params.height_mm, params.thickness_mm)));
+        return Err(AppError::NotFound(format!(
+            "No matching restos found for material '{}' with dimensions {}x{}x{} mm",
+            params.material, params.width_mm, params.height_mm, params.thickness_mm
+        )));
     }
 
     let best_match = candidates
@@ -601,18 +650,22 @@ async fn search_resto(
         .unwrap();
 
     tracing::info!(
-        search_dimensions = format!("{}x{}x{}", params.width_mm, params.height_mm, params.thickness_mm),
+        search_dimensions = format!(
+            "{}x{}x{}",
+            params.width_mm, params.height_mm, params.thickness_mm
+        ),
         match_id = best_match.id,
-        match_dimensions = format!("{}x{}x{}", best_match.width_mm, best_match.height_mm, best_match.thickness_mm),
+        match_dimensions = format!(
+            "{}x{}x{}",
+            best_match.width_mm, best_match.height_mm, best_match.thickness_mm
+        ),
         "Found best match"
     );
 
     Ok(Json(best_match))
 }
 
-async fn list_restos(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
+async fn list_restos(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let restos: Vec<Leftover> = sqlx::query_as(
         r#"
         SELECT id, width_mm, height_mm, thickness_mm, material, notes, created_at
@@ -642,7 +695,8 @@ async fn update_resto(
     .await
     .map_err(AppError::Database)?;
 
-    let resto = existing.ok_or_else(|| AppError::NotFound(format!("Resto with id {} not found", id)))?;
+    let resto =
+        existing.ok_or_else(|| AppError::NotFound(format!("Resto with id {} not found", id)))?;
 
     // Apply updates with defaults from existing
     let new_width = payload.width_mm.unwrap_or(resto.width_mm);
@@ -683,9 +737,7 @@ async fn update_resto(
     Ok(StatusCode::OK)
 }
 
-async fn get_stats(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
+async fn get_stats(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     // Total count and area
     let total: (i64, i64) = sqlx::query_as(
         r#"
@@ -745,11 +797,12 @@ async fn get_stats(
 
 async fn list_vans(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     tracing::info!("Listing vans");
-    let vans = sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE active = 1 ORDER BY created_at DESC")
-        .fetch_all(&state.db)
-        .await
-        .map_err(AppError::Database)?;
-    
+    let vans =
+        sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE active = 1 ORDER BY created_at DESC")
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::Database)?;
+
     Ok(Json(vans))
 }
 
@@ -764,7 +817,7 @@ async fn get_van(
         .await
         .map_err(AppError::Database)?
         .ok_or_else(|| AppError::NotFound(format!("Van {} not found", id)))?;
-    
+
     Ok(Json(van))
 }
 
@@ -773,35 +826,45 @@ async fn add_van(
     Json(req): Json<AddVanRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(name = %req.name, "Adding van");
-    
+
     // Validate
     if req.name.trim().is_empty() || req.name.len() > 128 {
-        return Err(AppError::Validation("Name must be 1-128 characters".to_string()));
+        return Err(AppError::Validation(
+            "Name must be 1-128 characters".to_string(),
+        ));
     }
     validate_van_dimensions(req.length_mm, req.width_mm, req.height_mm)?;
-    
+
     if let Some(weight) = req.max_weight_kg {
         if weight <= 0 || weight > 10000 {
-            return Err(AppError::Validation("Max weight must be 1-10000 kg".to_string()));
+            return Err(AppError::Validation(
+                "Max weight must be 1-10000 kg".to_string(),
+            ));
         }
     }
     if let Some(wh) = req.wheel_well_height_mm {
         if wh < 0 || wh > req.height_mm {
-            return Err(AppError::Validation("Wheel well height must be 0 to van height".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well height must be 0 to van height".to_string(),
+            ));
         }
     }
     if let Some(ww) = req.wheel_well_width_mm {
         if ww < 0 || ww > req.width_mm / 2 {
-            return Err(AppError::Validation("Wheel well width must be 0 to half van width".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well width must be 0 to half van width".to_string(),
+            ));
         }
     }
     if let Some(ws) = req.wheel_well_start_x_mm {
         if ws < 0 || ws > req.length_mm {
-            return Err(AppError::Validation("Wheel well start must be 0 to van length".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well start must be 0 to van length".to_string(),
+            ));
         }
     }
     validate_notes(&req.notes)?;
-    
+
     let result = sqlx::query(
         "INSERT INTO vans (name, length_mm, width_mm, height_mm, max_weight_kg, wheel_well_height_mm, wheel_well_width_mm, wheel_well_start_x_mm, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
@@ -817,7 +880,7 @@ async fn add_van(
     .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
-    
+
     Ok(Json(serde_json::json!({"id": result.last_insert_rowid()})))
 }
 
@@ -827,7 +890,7 @@ async fn update_van(
     Json(req): Json<UpdateVanRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(id = %id, "Updating van");
-    
+
     // Check exists
     let existing = sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE id = ?")
         .bind(id)
@@ -835,41 +898,51 @@ async fn update_van(
         .await
         .map_err(AppError::Database)?
         .ok_or_else(|| AppError::NotFound(format!("Van {} not found", id)))?;
-    
+
     // Validate updates
     if let Some(ref name) = req.name {
         if name.trim().is_empty() || name.len() > 128 {
-            return Err(AppError::Validation("Name must be 1-128 characters".to_string()));
+            return Err(AppError::Validation(
+                "Name must be 1-128 characters".to_string(),
+            ));
         }
     }
-    
+
     let length = req.length_mm.unwrap_or(existing.length_mm);
     let width = req.width_mm.unwrap_or(existing.width_mm);
     let height = req.height_mm.unwrap_or(existing.height_mm);
     validate_van_dimensions(length, width, height)?;
-    
+
     if let Some(weight) = req.max_weight_kg {
         if weight <= 0 || weight > 10000 {
-            return Err(AppError::Validation("Max weight must be 1-10000 kg".to_string()));
+            return Err(AppError::Validation(
+                "Max weight must be 1-10000 kg".to_string(),
+            ));
         }
     }
-    
+
     if let Some(wh) = req.wheel_well_height_mm {
         if wh < 0 || wh > height {
-            return Err(AppError::Validation("Wheel well height must be 0 to van height".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well height must be 0 to van height".to_string(),
+            ));
         }
     }
     if let Some(ww) = req.wheel_well_width_mm {
         if ww < 0 || ww > width / 2 {
-            return Err(AppError::Validation("Wheel well width must be 0 to half van width".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well width must be 0 to half van width".to_string(),
+            ));
         }
     }
     if let Some(ws) = req.wheel_well_start_x_mm {
         if ws < 0 || ws > length {
-            return Err(AppError::Validation("Wheel well start must be 0 to van length".to_string()));
+            return Err(AppError::Validation(
+                "Wheel well start must be 0 to van length".to_string(),
+            ));
         }
     }
-    
+
     sqlx::query(
         "UPDATE vans SET name = COALESCE(?, name), length_mm = COALESCE(?, length_mm), 
          width_mm = COALESCE(?, width_mm), height_mm = COALESCE(?, height_mm), 
@@ -891,7 +964,7 @@ async fn update_van(
     .execute(&state.db)
     .await
     .map_err(AppError::Database)?;
-    
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -900,18 +973,18 @@ async fn delete_van(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(id = %id, "Soft deleting van");
-    
+
     let rows = sqlx::query("UPDATE vans SET active = 0 WHERE id = ?")
         .bind(id)
         .execute(&state.db)
         .await
         .map_err(AppError::Database)?
         .rows_affected();
-    
+
     if rows == 0 {
         return Err(AppError::NotFound(format!("Van {} not found", id)));
     }
-    
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -934,21 +1007,29 @@ impl FreeSpace {
     fn volume(&self) -> i64 {
         self.length * self.width * self.height
     }
-    
+
     fn can_fit(&self, item_l: i64, item_w: i64, item_h: i64) -> bool {
         item_l <= self.length && item_w <= self.width && item_h <= self.height
     }
 }
 
-fn is_in_wheel_well(x: i64, y: i64, z: i64, length: i64, width: i64, height: i64, van: &Van) -> bool {
+fn is_in_wheel_well(
+    x: i64,
+    y: i64,
+    z: i64,
+    length: i64,
+    width: i64,
+    height: i64,
+    van: &Van,
+) -> bool {
     let wheel_start = van.wheel_well_start_x_mm.unwrap_or(van.length_mm + 1);
     let wheel_height = van.wheel_well_height_mm.unwrap_or(0);
     let wheel_width = van.wheel_well_width_mm.unwrap_or(0);
-    
+
     if wheel_height == 0 || wheel_width == 0 {
         return false; // No wheel wells
     }
-    
+
     // Check if item overlaps with wheel well zones
     let item_bottom = y;
     let _item_top = y + height;
@@ -956,7 +1037,7 @@ fn is_in_wheel_well(x: i64, y: i64, z: i64, length: i64, width: i64, height: i64
     let _item_back = x + length;
     let item_left = z;
     let item_right = z + width;
-    
+
     // Wheel wells only exist from wheel_start_x onwards and up to wheel_height from floor
     if item_front >= wheel_start && item_bottom < wheel_height {
         // Check left wheel well
@@ -968,11 +1049,15 @@ fn is_in_wheel_well(x: i64, y: i64, z: i64, length: i64, width: i64, height: i64
             return true;
         }
     }
-    
+
     false
 }
 
-fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> Vec<PositionedItem> {
+fn pack_items_3d(
+    items: &[CargoItem],
+    van: &Van,
+    warnings: &mut Vec<String>,
+) -> Vec<PositionedItem> {
     let mut positioned = Vec::new();
     let mut free_spaces = vec![FreeSpace {
         x: 0,
@@ -982,7 +1067,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
         width: van.width_mm,
         height: van.height_mm,
     }];
-    
+
     // Sort items: fragile first (go on top), then heavy (bottom), then largest volume
     let mut sorted_items: Vec<(usize, &CargoItem)> = items.iter().enumerate().collect();
     sorted_items.sort_by(|a, b| {
@@ -993,7 +1078,10 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
             _ => {}
         }
         // Priority 2: Heavy first
-        let weight_cmp = b.1.weight_kg.partial_cmp(&a.1.weight_kg).unwrap_or(std::cmp::Ordering::Equal);
+        let weight_cmp =
+            b.1.weight_kg
+                .partial_cmp(&a.1.weight_kg)
+                .unwrap_or(std::cmp::Ordering::Equal);
         if weight_cmp != std::cmp::Ordering::Equal {
             return weight_cmp;
         }
@@ -1002,7 +1090,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
         let vol_b = b.1.length_mm * b.1.width_mm * b.1.height_mm;
         vol_b.cmp(&vol_a)
     });
-    
+
     for (_idx, item) in sorted_items {
         let orientations = if item.rotation_allowed {
             vec![
@@ -1016,10 +1104,10 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
         } else {
             vec![(item.length_mm, item.width_mm, item.height_mm, 0)]
         };
-        
+
         let mut best_fit: Option<(usize, i64, i64, i64, i64, i64, i64, i64)> = None;
         let mut best_waste = i64::MAX;
-        
+
         for (space_idx, space) in free_spaces.iter().enumerate() {
             for (l, w, h, rot) in &orientations {
                 if space.can_fit(*l, *w, *h) {
@@ -1027,7 +1115,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                     if is_in_wheel_well(space.x, space.y, space.z, *l, *w, *h, van) {
                         continue;
                     }
-                    
+
                     let waste = space.volume() - (l * w * h);
                     if waste < best_waste {
                         best_waste = waste;
@@ -1036,7 +1124,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                 }
             }
         }
-        
+
         if let Some((space_idx, x, y, z, l, w, h, rot)) = best_fit {
             positioned.push(PositionedItem {
                 item: item.clone(),
@@ -1044,10 +1132,10 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                 rotation: Rotation3D { x: 0, y: rot, z: 0 },
                 level: (y / 500) as i32,
             });
-            
+
             // Remove used space and create new free spaces (Guillotine split)
             let used_space = free_spaces.remove(space_idx);
-            
+
             // Split along length (X axis)
             if used_space.length > l {
                 free_spaces.push(FreeSpace {
@@ -1059,7 +1147,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                     height: used_space.height,
                 });
             }
-            
+
             // Split along width (Z axis)
             if used_space.width > w {
                 free_spaces.push(FreeSpace {
@@ -1071,7 +1159,7 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                     height: used_space.height,
                 });
             }
-            
+
             // Split along height (Y axis)
             if used_space.height > h {
                 free_spaces.push(FreeSpace {
@@ -1083,14 +1171,14 @@ fn pack_items_3d(items: &[CargoItem], van: &Van, warnings: &mut Vec<String>) -> 
                     height: used_space.height - h,
                 });
             }
-            
+
             // Merge overlapping spaces (simplified - just sort by volume)
             free_spaces.sort_by(|a, b| b.volume().cmp(&a.volume()));
         } else {
             warnings.push(format!("Item '{}' could not be placed", item.description));
         }
     }
-    
+
     positioned
 }
 
@@ -1101,52 +1189,50 @@ async fn optimize_loading(
     Json(req): Json<OptimizeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(van_id = %req.van_id, items = %req.items.len(), "Optimizing load");
-    
-    // Get van details
+
+    // Get van details (async I/O)
     let van = sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE id = ? AND active = 1")
         .bind(req.van_id)
         .fetch_optional(&state.db)
         .await
         .map_err(AppError::Database)?
         .ok_or_else(|| AppError::NotFound(format!("Van {} not found or inactive", req.van_id)))?;
-    
-    // Validate items
-    let mut warnings = Vec::new();
+
+    // Validate items (quick, keep on async thread)
     let mut total_weight = 0.0;
-    
     for item in &req.items {
         if item.description.trim().is_empty() {
-            return Err(AppError::Validation("Item description cannot be empty".to_string()));
+            return Err(AppError::Validation(
+                "Item description cannot be empty".to_string(),
+            ));
         }
         if item.length_mm < 10 || item.length_mm > 5000 {
-            return Err(AppError::Validation(format!("Item '{}': length must be 10-5000mm", item.description)));
+            return Err(AppError::Validation(format!(
+                "Item '{}': length must be 10-5000mm",
+                item.description
+            )));
         }
         if item.width_mm < 10 || item.width_mm > 5000 {
-            return Err(AppError::Validation(format!("Item '{}': width must be 10-5000mm", item.description)));
+            return Err(AppError::Validation(format!(
+                "Item '{}': width must be 10-5000mm",
+                item.description
+            )));
         }
         if item.height_mm < 10 || item.height_mm > 5000 {
-            return Err(AppError::Validation(format!("Item '{}': height must be 10-5000mm", item.description)));
+            return Err(AppError::Validation(format!(
+                "Item '{}': height must be 10-5000mm",
+                item.description
+            )));
         }
         if item.weight_kg <= 0.0 || item.weight_kg > 500.0 {
-            return Err(AppError::Validation(format!("Item '{}': weight must be 0.1-500kg", item.description)));
+            return Err(AppError::Validation(format!(
+                "Item '{}': weight must be 0.1-500kg",
+                item.description
+            )));
         }
-        
         total_weight += item.weight_kg;
-        
-        // Warnings for oversized items
-        if item.length_mm > van.length_mm || item.width_mm > van.width_mm || item.height_mm > van.height_mm {
-            warnings.push(format!("Item '{}' may not fit ({}×{}×{}mm exceeds van dimensions)", 
-                item.description, item.length_mm, item.width_mm, item.height_mm));
-        }
     }
-    
-    // Check weight limit
-    if let Some(max_weight) = van.max_weight_kg {
-        if total_weight > max_weight as f64 {
-            warnings.push(format!("Total weight ({:.1}kg) exceeds van capacity ({}kg)", total_weight, max_weight));
-        }
-    }
-    
+
     if req.items.is_empty() {
         return Ok(Json(OptimizeResponse {
             success: false,
@@ -1154,19 +1240,52 @@ async fn optimize_loading(
             warnings: vec!["No items to load".to_string()],
         }));
     }
-    
-    // TODO: Run 3D bin packing algorithm here
+
+    // Offload CPU-intensive 3D bin packing to a blocking thread
+    let items = req.items.clone();
+    let van_clone = van.clone();
+    let max_weight = van.max_weight_kg;
+
+    let (positioned_items, mut warnings) = tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+
+        // Check for oversized items
+        for item in &items {
+            if item.length_mm > van_clone.length_mm
+                || item.width_mm > van_clone.width_mm
+                || item.height_mm > van_clone.height_mm
+            {
+                warnings.push(format!(
+                    "Item '{}' may not fit ({}×{}×{}mm exceeds van dimensions)",
+                    item.description, item.length_mm, item.width_mm, item.height_mm
+                ));
+            }
+        }
+
+        let positioned = pack_items_3d(&items, &van_clone, &mut warnings);
+        (positioned, warnings)
+    })
+    .await
+    .map_err(|e| AppError::Validation(format!("Optimization task failed: {}", e)))?;
+
+    // Check weight limit
+    if let Some(max_w) = max_weight {
+        if total_weight > max_w as f64 {
+            warnings.push(format!(
+                "Total weight ({:.1}kg) exceeds van capacity ({}kg)",
+                total_weight, max_w
+            ));
+        }
+    }
+
     let van_volume = van.length_mm * van.width_mm * van.height_mm;
-    
-    // Run 3D bin packing
-    let positioned_items = pack_items_3d(&req.items, &van, &mut warnings);
-    
-    let used_volume: i64 = positioned_items.iter()
+    let used_volume: i64 = positioned_items
+        .iter()
         .map(|pi| pi.item.length_mm * pi.item.width_mm * pi.item.height_mm)
         .sum();
-    
+
     let utilization = (used_volume as f64 / van_volume as f64 * 100.0).min(100.0);
-    
+
     let plan = LoadingPlan {
         items: positioned_items,
         total_weight,
@@ -1174,7 +1293,7 @@ async fn optimize_loading(
         van_volume,
         used_volume,
     };
-    
+
     Ok(Json(OptimizeResponse {
         success: true,
         plan: Some(plan),
@@ -1205,7 +1324,7 @@ async fn readiness_check(State(state): State<AppState>) -> Result<impl IntoRespo
         .execute(&state.db)
         .await
         .map_err(AppError::Database)?;
-    
+
     Ok(Json(ReadinessResponse {
         status: "ready".to_string(),
         database: "connected".to_string(),

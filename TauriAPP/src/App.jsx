@@ -6,7 +6,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 async function optimizeCuts(cuttingList, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
-  
   const cuts = cuttingList.map(cut => ({
     width_mm: parseInt(cut.width_mm),
     height_mm: parseInt(cut.height_mm),
@@ -14,35 +13,12 @@ async function optimizeCuts(cuttingList, settings) {
     material: cut.material,
     quantity: parseInt(cut.quantity)
   }));
-  
-  console.log('Sending cuts to API:', cuts);
-  
   const response = await optimizeCutsAPI(cuts, kerfWidth, minRemainderWidth, minRemainderHeight);
-  
-  console.log('Received response from API:', response);
-  
-  if (!response || !response.used_planks) {
-    throw new Error('Invalid response from server');
-  }
-  
+  if (!response || !response.used_planks) throw new Error('Invalid response');
   return {
     usedPlanks: response.used_planks.map(plank => ({
-      resto: {
-        id: plank.resto_id,
-        width_mm: plank.width_mm,
-        height_mm: plank.height_mm,
-        thickness_mm: plank.thickness_mm,
-        material: plank.material
-      },
-      cuts: plank.cuts.map(cut => ({
-        x: cut.x,
-        y: cut.y,
-        width_mm: cut.width,
-        height_mm: cut.height,
-        rotated: cut.rotated,
-        material: cut.material,
-        thickness_mm: cut.thickness_mm
-      })),
+      resto: { id: plank.resto_id, width_mm: plank.width_mm, height_mm: plank.height_mm, thickness_mm: plank.thickness_mm, material: plank.material },
+      cuts: plank.cuts.map(cut => ({ x: cut.x, y: cut.y, width_mm: cut.width, height_mm: cut.height, rotated: cut.rotated, material: cut.material, thickness_mm: cut.thickness_mm })),
       wastePercent: plank.waste_percent
     })),
     unplacedCuts: (response.unplaced_cuts || []).map(([idx, cut]) => cut),
@@ -75,6 +51,17 @@ function IconTrash(props){
   );
 }
 
+function getHumanLocationUI(item, van) {
+  if (!item?.position) return "-";
+  const { x, y, z } = item.position;
+  const { placed_width } = item;
+  
+  let h = y === 0 ? "Chão" : y < 1000 ? "Nível Médio" : "Topo";
+  let d = x === 0 ? "Fundo" : x < van.length_mm / 2 ? "Meio" : "Frente";
+  let s = z === 0 ? "Esq" : (z + placed_width >= van.width_mm) ? "Dir" : "Centro";
+  return `${h}, ${d}, ${s}`;
+}
+
 function IconGear(props){
   return (
     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden {...props}>
@@ -97,6 +84,7 @@ function App() {
   const [filterMaterial, setFilterMaterial] = useState("");
   const [filterThickness, setFilterThickness] = useState("");
 
+
   const [vans, setVans] = useState([]);
   const [selectedVanId, setSelectedVanId] = useState(null);
   const [cargoItems, setCargoItems] = useState([]);
@@ -109,6 +97,7 @@ function App() {
   const [multiTripPlans, setMultiTripPlans] = useState([]);
   const [currentTripIndex, setCurrentTripIndex] = useState(0);
   const [unplacedItems, setUnplacedItems] = useState([]);
+  
 
   const [estadoData, setEstadoData] = useState({
     mainServer: { status: 'unknown', uptime: 0 },
@@ -372,38 +361,34 @@ async function fetchEstado() {
     }
   }
 
-  async function handleGeneratePlan() {
+async function handleGeneratePlan() {
     if (!selectedVanId || cargoItems.length === 0) return;
     
     try {
       setIsOptimizing(true);
       setOptimizeWarnings([]);
       setMultiTripPlans([]);
-      setUnplacedItems([]);
+      setUnplacedItems([]); // Clear previous
       setCurrentTripIndex(0);
       
       const result = await optimizeLoading(selectedVanId, cargoItems);
       
-      if (result.warnings && result.warnings.length > 0) {
-        setOptimizeWarnings(result.warnings);
-      }
-
       if (result.success && result.plan) {
         setLoadingPlan(result.plan);
-        setMultiTripPlans([{ tripNumber: 1, plan: result.plan, items: cargoItems }]);
+        setUnplacedItems(result.unplaced_items || []); // Capture leftovers
+        setMultiTripPlans([{ tripNumber: 1, plan: result.plan, items: cargoItems }]); // Treat single as trip 1
         setOptimizeWarnings(result.warnings || []);
       } else {
         setLoadingPlan(null);
-
         const errorMsg = result.warnings && result.warnings.length > 0
           ? result.warnings.join('\n')
           : 'Falha desconhecida (sem detalhes do servidor)';
-          
         alert(`Não foi possível gerar o plano:\n\n${errorMsg}`);
       }
     } catch (err) {
       console.error('Optimization failed:', err);
-      alert('Erro de comunicação: ' + err.message);
+      let msg = err.message || "Erro desconhecido";
+      alert(`Erro no servidor:\n${msg}`);
     } finally {
       setIsOptimizing(false);
     }
@@ -419,157 +404,250 @@ async function fetchEstado() {
       setMultiTripPlans([]);
       setUnplacedItems([]);
       
-      let remainingItems = [...cargoItems];
+      let itemsToPack = [...cargoItems];
       const trips = [];
       let tripNumber = 1;
       const allWarnings = [];
       
-      const unfittableItems = []; // Items that can never fit in the van
-      
-      while (remainingItems.length > 0 && tripNumber <= 50) { // Max 50 trips safety
-        const result = await optimizeLoading(selectedVanId, remainingItems);
+      // Loop until all items packed or we hit safety limit
+      while (itemsToPack.length > 0 && tripNumber <= 10) {
+        const result = await optimizeLoading(selectedVanId, itemsToPack);
         
-        if (result.success && result.plan && result.plan.items.length > 0) {
-          // Find which items were placed
-          const placedDescriptions = result.plan.items.map(i => i.item.description);
-          const placedItems = remainingItems.filter(item => 
-            placedDescriptions.includes(item.description)
-          );
-          
-          // Remove placed items from remaining (match by index to handle duplicates)
-          const placedIndices = [];
-          for (const placed of result.plan.items) {
-            const idx = remainingItems.findIndex((item, i) => 
-              !placedIndices.includes(i) && item.description === placed.item.description
-            );
-            if (idx !== -1) placedIndices.push(idx);
-          }
-          
-          remainingItems = remainingItems.filter((_, i) => !placedIndices.includes(i));
-          
+        if (result.success && result.plan) {
+          // Add this trip
           trips.push({
             tripNumber,
             plan: result.plan,
-            items: placedItems,
+            items: result.plan.items.map(pi => pi.item),
             warnings: result.warnings || []
           });
           
-          // Only add warnings about items that truly can't fit (not "could not be placed" warnings)
-          if (result.warnings) {
-            const importantWarnings = result.warnings.filter(w => 
-              w.includes('cannot fit in van') || w.includes('demasiado grande')
-            );
-            allWarnings.push(...importantWarnings.map(w => `Viagem ${tripNumber}: ${w}`));
+          if (result.warnings) allWarnings.push(...result.warnings);
+          
+          // Next iteration tries to pack ONLY what was left over
+          const leftovers = result.unplaced_items || [];
+          
+          // Optimization: If leftovers count matches input count, we made NO progress. Stop to avoid infinite loop.
+          if (leftovers.length === itemsToPack.length) {
+             allWarnings.push(`Impossível carregar os restantes ${leftovers.length} itens (demasiado grandes?)`);
+             setUnplacedItems(leftovers);
+             break;
           }
           
+          itemsToPack = leftovers;
           tripNumber++;
         } else {
-          // No items could be placed - check if they're simply too big for the van
-          // An item is unfittable if ALL its rotations exceed van dimensions
-          const van = vans.find(v => v.id === selectedVanId);
-          if (van) {
-            const stillFittable = [];
-            for (const item of remainingItems) {
-              const dims = [item.length_mm, item.width_mm, item.height_mm].sort((a, b) => a - b);
-              const vanDims = [van.length_mm, van.width_mm, van.height_mm].sort((a, b) => a - b);
-              // Check if smallest fits in smallest, etc.
-              const canFit = item.rotation_allowed 
-                ? (dims[0] <= vanDims[0] && dims[1] <= vanDims[1] && dims[2] <= vanDims[2])
-                : (item.length_mm <= van.length_mm && item.width_mm <= van.width_mm && item.height_mm <= van.height_mm);
-              
-              if (canFit) {
-                stillFittable.push(item);
-              } else {
-                unfittableItems.push(item);
-                allWarnings.push(`Item '${item.description}' (${item.length_mm}×${item.width_mm}×${item.height_mm}mm) é demasiado grande para a carrinha`);
-              }
-            }
-            remainingItems = stillFittable;
-            if (remainingItems.length === 0) break;
-          } else {
-            allWarnings.push(`Não foi possível colocar ${remainingItems.length} item(s)`);
-            break;
-          }
+          allWarnings.push("Erro ao calcular uma das viagens.");
+          break;
         }
       }
-      
-      // Combine remaining + unfittable items
-      const allUnplaced = [...remainingItems, ...unfittableItems];
       
       if (trips.length > 0) {
         setMultiTripPlans(trips);
         setCurrentTripIndex(0);
-        setLoadingPlan(trips[0].plan);
-        setUnplacedItems(allUnplaced);
+        setLoadingPlan(trips[0].plan); // Show first trip
         setOptimizeWarnings(allWarnings);
-      } else if (unfittableItems.length > 0) {
-        // All items are too big for the van
-        setUnplacedItems(allUnplaced);
-        setOptimizeWarnings(allWarnings);
-        alert(`Nenhum item cabe na carrinha selecionada. ${unfittableItems.length} item(s) são demasiado grandes.`);
       } else {
-        alert('Não foi possível criar nenhum plano de carregamento');
+        alert('Não foi possível gerar nenhum plano válido.');
       }
+      
     } catch (err) {
       console.error('Multi-trip optimization failed:', err);
-      alert('Erro ao gerar plano multi-viagem');
+      alert('Erro ao gerar plano multi-viagem: ' + err.message);
     } finally {
       setIsOptimizing(false);
     }
   }
   
   // Export/Print loading order
-  function handleExportLoadingOrder() {
-    const van = vans.find(v => v.id === selectedVanId);
-    if (!van || multiTripPlans.length === 0) {
-      alert('Sem plano para imprimir. Gere um plano primeiro.');
-      return;
+function generatePrintableLoadingOrder(van, multiTripPlans, allCargoItems) {
+  
+  // Lógica para encontrar o item que está POR BAIXO
+  const findSupportingItem = (item, allTripItems) => {
+    // Se está no chão (y=0) ou em cima da cava da roda (y ~ 300-400 e sem item por baixo), não tem "pai"
+    if (item.position.y === 0) return null;
+
+    let bestSupport = null;
+    let maxOverlapArea = 0;
+
+    const myX = item.position.x;
+    const myZ = item.position.z;
+    const myL = item.placed_length;
+    const myW = item.placed_width;
+
+    for (const other of allTripItems) {
+      if (other === item) continue;
+
+      // Verifica se o 'other' está imediatamente abaixo (com margem de erro de 1mm)
+      const otherTop = other.position.y + other.placed_height;
+      if (Math.abs(otherTop - item.position.y) > 5) continue;
+
+      // Verifica se há sobreposição física (colisão 2D vista de cima)
+      const otherX = other.position.x;
+      const otherZ = other.position.z;
+      const otherL = other.placed_length;
+      const otherW = other.placed_width;
+
+      const overlapX = Math.max(0, Math.min(myX + myL, otherX + otherL) - Math.max(myX, otherX));
+      const overlapZ = Math.max(0, Math.min(myZ + myW, otherZ + otherW) - Math.max(myZ, otherZ));
+      
+      const area = overlapX * overlapZ;
+
+      // Se sobrepõe e é a maior área encontrada até agora, é o nosso suporte principal
+      if (area > 0 && area > maxOverlapArea) {
+        maxOverlapArea = area;
+        bestSupport = other;
+      }
     }
     
-    try {
-      const printContent = generatePrintableLoadingOrder(van, multiTripPlans, cargoItems);
-      
-      // Create a hidden iframe for printing (works better in Tauri)
-      const printFrame = document.createElement('iframe');
-      printFrame.style.position = 'fixed';
-      printFrame.style.right = '0';
-      printFrame.style.bottom = '0';
-      printFrame.style.width = '0';
-      printFrame.style.height = '0';
-      printFrame.style.border = '0';
-      document.body.appendChild(printFrame);
-      
-      const frameDoc = printFrame.contentWindow.document;
-      frameDoc.open();
-      frameDoc.write(printContent);
-      frameDoc.close();
-      
-      // Wait for content to load then print
-      printFrame.onload = () => {
-        try {
-          printFrame.contentWindow.focus();
-          printFrame.contentWindow.print();
-        } catch (e) {
-          console.error('Print error:', e);
-          // Fallback: open in new window
-          const newWindow = window.open('', '_blank');
-          if (newWindow) {
-            newWindow.document.write(printContent);
-            newWindow.document.close();
-            newWindow.focus();
-            newWindow.print();
-          } else {
-            alert('Não foi possível abrir a janela de impressão. Verifique se os popups estão permitidos.');
-          }
-        }
-        // Clean up after a delay
-        setTimeout(() => document.body.removeChild(printFrame), 1000);
-      };
-    } catch (err) {
-      console.error('Export failed:', err);
-      alert('Erro ao exportar: ' + err.message);
+    // Só consideramos suporte se cobrir uma parte significativa (opcional, aqui aceitamos qualquer apoio)
+    return bestSupport;
+  };
+
+  const getHumanLocation = (item, vanLength, vanWidth, allItemsInTrip) => {
+    const { x, y, z } = item.position;
+    const { placed_width } = item;
+    
+    let parts = [];
+    
+    // 1. ALTURA (A GRANDE MUDANÇA)
+    const support = findSupportingItem(item, allItemsInTrip);
+    
+    if (y === 0) {
+      parts.push("No Chão");
+    } else if (support) {
+      // Se encontrou suporte, dizemos o nome!
+      parts.push(`Em cima de "${support.item.description}"`);
+    } else if (y > 0 && y < van.wheel_well_height_mm + 50) {
+       // Se está baixo mas não no chão (provavelmente cava da roda)
+       parts.push("Sobre a Roda/Cava");
+    } else if (y < 1000) {
+      parts.push("Nível Médio");
+    } else {
+      parts.push("Topo");
     }
-  }
+
+    // 2. PROFUNDIDADE (Fundo -> Porta)
+    if (x === 0) parts.push("Fundo");
+    else if (x < vanLength * 0.3) parts.push("Fundo");
+    else if (x < vanLength * 0.6) parts.push("Meio");
+    else parts.push("Porta");
+
+    // 3. LADO (Esquerda -> Direita)
+    if (z === 0) parts.push("Esq");
+    else if (z + placed_width >= vanWidth) parts.push("Dir");
+    else parts.push("Centro");
+
+    return parts.join(" - ");
+  };
+
+  // --- GERAÇÃO DO HTML ---
+  const tripsHtml = multiTripPlans.map((trip, tripIndex) => {
+    // Ordenar para impressão: Do Fundo para a Frente (X crescente), Chão para o Teto (Y crescente)
+    // Nota: Para carregar a carrinha, queremos o inverso (o que entra primeiro).
+    // Mas numa lista de conferência, geralmente lemos do fundo para a porta.
+    const sortedItems = [...trip.plan.items].sort((a, b) => {
+      // Agrupar por "paredes" (X semelhante)
+      const xDiff = a.position.x - b.position.x;
+      if (Math.abs(xDiff) > 100) return xDiff; 
+      
+      // Dentro da mesma "parede", do chão para cima
+      return a.position.y - b.position.y;
+    });
+
+    return `
+      <div class="trip-block">
+        <div class="trip-header">
+          <h2>Viagem ${trip.tripNumber} de ${multiTripPlans.length}</h2>
+          <div class="trip-stats">
+            <span>Itens: <strong>${trip.plan.items.length}</strong></span>
+            <span>Peso: <strong>${trip.plan.total_weight.toFixed(1)} kg</strong></span>
+            <span>Ocupação: <strong>${trip.plan.utilization_percent.toFixed(1)}%</strong></span>
+          </div>
+        </div>
+        
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 5%">#</th>
+              <th style="width: 35%">Item</th>
+              <th style="width: 20%">Dimensões (mm)</th>
+              <th style="width: 30%">Posição (Instrução)</th>
+              <th style="width: 10%">Notas</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sortedItems.map((item, idx) => `
+              <tr>
+                <td>${idx + 1}</td>
+                <td>
+                  <strong>${item.item.description}</strong>
+                  ${item.rotation && (item.rotation.x !== 0 || item.rotation.y !== 0) ? '<br><span class="muted small">(Rodado)</span>' : ''}
+                </td>
+                <td>${item.placed_length} x ${item.placed_width} x ${item.placed_height}</td>
+                <td style="font-weight: 500; color: #333;">
+                  ${getHumanLocation(item, van.length_mm, van.width_mm, trip.plan.items)}
+                </td>
+                <td class="${item.item.fragile ? 'fragile' : ''}">${item.item.fragile ? 'FRÁGIL' : ''}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="page-break"></div>
+    `;
+  }).join('');
+
+  // Identificar itens não carregados (global)
+  // (Lógica simplificada: assumimos que 'unplacedItems' já foi calculado no componente React e podia ser passado, 
+  // mas aqui geramos apenas com base no que foi planeado vs total)
+  
+  return `
+    <!DOCTYPE html>
+    <html lang="pt">
+    <head>
+      <meta charset="UTF-8">
+      <title>Plano de Carregamento - ${van.name}</title>
+      <style>
+        @page { size: A4; margin: 15mm; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; color: #333; font-size: 13px; }
+        h1 { border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; font-size: 24px; }
+        .trip-block { margin-bottom: 40px; }
+        .trip-header { background: #f0f4f8; padding: 15px; border-radius: 6px; margin-bottom: 15px; border-left: 5px solid #2196F3; }
+        .trip-header h2 { margin: 0 0 10px 0; font-size: 18px; }
+        .trip-stats { display: flex; gap: 20px; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+        th { background-color: #f2f2f2; font-weight: bold; }
+        tr:nth-child(even) { background-color: #fafafa; }
+        .fragile { color: #d32f2f; font-weight: bold; }
+        .muted { color: #666; font-size: 0.85em; }
+        .page-break { page-break-after: always; }
+        .page-break:last-child { page-break-after: auto; }
+        .footer { margin-top: 30px; font-size: 11px; color: #666; border-top: 1px solid #eee; padding-top: 10px; text-align: center; }
+        
+        @media print {
+          body { padding: 0; }
+          .trip-header { -webkit-print-color-adjust: exact; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>Ordem de Carregamento</h1>
+        <p><strong>Veículo:</strong> ${van.name} (${van.length_mm}x${van.width_mm}x${van.height_mm}mm)</p>
+        <p><strong>Data:</strong> ${new Date().toLocaleDateString('pt-PT')} ${new Date().toLocaleTimeString('pt-PT')}</p>
+      </div>
+
+      ${tripsHtml}
+
+      <div class="footer">
+        * A lista está ordenada por posição física (Fundo -> Porta). Para carregar, siga a ordem da lista.
+      </div>
+    </body>
+    </html>
+  `;
+}
   
   function generatePrintableLoadingOrder(van, trips, allItems) {
     const date = new Date().toLocaleDateString('pt-PT');
@@ -696,6 +774,142 @@ async function fetchEstado() {
     `;
     
     return html;
+  }
+
+function handleExportLoadingOrder() {
+    const van = vans.find(v => v.id === selectedVanId);
+    if (!van || multiTripPlans.length === 0) {
+      alert('Sem plano para imprimir. Gere um plano primeiro.');
+      return;
+    }
+    
+    // 1. Human Readable Helper
+    const getHumanLocation = (item, vanLength, vanWidth) => {
+      const { x, y, z } = item.position;
+      const { placed_width } = item;
+      
+      let parts = [];
+      // Height
+      if (y === 0) parts.push("No Chão");
+      else if (y > 0 && y < 1000) parts.push("Nível Médio");
+      else parts.push("Topo");
+      // Depth
+      if (x === 0) parts.push("Fundo");
+      else if (x < vanLength / 2) parts.push("Meio");
+      else parts.push("Porta");
+      // Side
+      if (z === 0) parts.push("Esq");
+      else if (z + placed_width >= vanWidth) parts.push("Dir");
+      else parts.push("Centro");
+
+      return parts.join(" - ");
+    };
+
+    // 2. Build HTML
+    const tripsHtml = multiTripPlans.map((trip) => {
+      // Sort: Floor up (Y), Back to Front (X)
+      const sortedItems = [...trip.plan.items].sort((a, b) => {
+        if (a.position.x !== b.position.x) return a.position.x - b.position.x;
+        return a.position.y - b.position.y;
+      });
+
+      return `
+        <div class="trip-block">
+          <div class="trip-header">
+            <h2>Viagem ${trip.tripNumber}</h2>
+            <div class="trip-stats">
+              <span>Itens: <strong>${trip.plan.items.length}</strong></span>
+              <span>Peso: <strong>${trip.plan.total_weight.toFixed(1)} kg</strong></span>
+              <span>Ocupação: <strong>${trip.plan.utilization_percent.toFixed(1)}%</strong></span>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width:5%">#</th>
+                <th style="width:40%">Item</th>
+                <th style="width:20%">Dimensões</th>
+                <th style="width:25%">Posição</th>
+                <th style="width:10%">Notas</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sortedItems.map((item, idx) => `
+                <tr>
+                  <td>${idx + 1}</td>
+                  <td>${item.item.description}</td>
+                  <td>${item.placed_length}x${item.placed_width}x${item.placed_height}</td>
+                  <td>${getHumanLocation(item, van.length_mm, van.width_mm)}</td>
+                  <td class="${item.item.fragile ? 'fragile' : ''}">${item.item.fragile ? 'FRÁGIL' : ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="page-break"></div>
+      `;
+    }).join('');
+
+    const unplacedHtml = unplacedItems.length > 0 ? `
+      <div class="unplaced-block">
+        <h3 style="color: #d32f2f;">⚠ Itens Não Carregados (${unplacedItems.length})</h3>
+        <ul>
+          ${unplacedItems.map(i => `<li>${i.description} (${i.length_mm}x${i.width_mm}x${i.height_mm})</li>`).join('')}
+        </ul>
+      </div>
+    ` : '';
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Ordem de Carregamento</title>
+        <style>
+          body { font-family: sans-serif; padding: 20px; }
+          .trip-header { background: #eee; padding: 10px; border-left: 5px solid #333; margin-bottom: 10px; }
+          .trip-stats { display: flex; gap: 15px; font-size: 0.9em; margin-top: 5px; }
+          table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; }
+          th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+          th { background: #f9f9f9; }
+          .fragile { color: red; font-weight: bold; }
+          .page-break { page-break-after: always; }
+          .unplaced-block { border: 1px solid red; padding: 10px; background: #fff5f5; }
+        </style>
+      </head>
+      <body>
+        <h1>Plano de Carregamento - ${van.name}</h1>
+        ${tripsHtml}
+        ${unplacedHtml}
+      </body>
+      </html>
+    `;
+
+    // 3. Print via Iframe
+    const printFrame = document.createElement('iframe');
+    printFrame.style.position = 'fixed';
+    printFrame.style.right = '0';
+    printFrame.style.bottom = '0';
+    printFrame.style.width = '0';
+    printFrame.style.height = '0';
+    printFrame.style.border = '0';
+    document.body.appendChild(printFrame);
+    
+    const frameDoc = printFrame.contentWindow.document;
+    frameDoc.open();
+    frameDoc.write(htmlContent);
+    frameDoc.close();
+    
+    printFrame.onload = () => {
+      try {
+        printFrame.contentWindow.focus();
+        printFrame.contentWindow.print();
+      } catch (e) {
+        console.error(e);
+        alert('Erro ao imprimir via iframe.');
+      }
+      setTimeout(() => document.body.removeChild(printFrame), 2000);
+    };
   }
 
   useEffect(() => { refresh(); }, []);
@@ -1516,9 +1730,21 @@ async function fetchEstado() {
                         {multiTripPlans.length} viagens necessárias para {cargoItems.length} itens
                       </span>
                       {unplacedItems.length > 0 && (
-                        <span style={{marginLeft: '10px', color: '#d32f2f'}}>
-                          ({unplacedItems.length} item(s) não coube(m))
-                        </span>
+                        <div style={{marginTop: '15px', padding: '15px', background: '#ffebee', border: '1px solid #ef5350', borderRadius: '4px'}}>
+                      <h4 style={{margin: '0 0 10px 0', color: '#c62828', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                        ⚠ {unplacedItems.length} Itens Não Carregados
+                      </h4>
+                      <p style={{fontSize: '13px', margin: '0 0 10px 0', color: '#333'}}>
+                        Estes itens não cabem na carrinha e ficaram para trás:
+                      </p>
+                      <ul style={{margin: 0, paddingLeft: '20px', color: '#b71c1c', maxHeight: '100px', overflowY: 'auto'}}>
+                        {unplacedItems.map((item, idx) => (
+                          <li key={idx} style={{fontSize: '13px'}}>
+                            <strong>{item.description}</strong> ({item.length_mm}x{item.width_mm}x{item.height_mm})
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                       )}
                     </div>
                   )}

@@ -104,6 +104,11 @@ function App() {
   const [optimizeWarnings, setOptimizeWarnings] = useState([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [vansLoading, setVansLoading] = useState(true);
+  
+  // Multi-trip planning
+  const [multiTripPlans, setMultiTripPlans] = useState([]);
+  const [currentTripIndex, setCurrentTripIndex] = useState(0);
+  const [unplacedItems, setUnplacedItems] = useState([]);
 
   const [estadoData, setEstadoData] = useState({
     mainServer: { status: 'unknown', uptime: 0 },
@@ -373,20 +378,324 @@ async function fetchEstado() {
     try {
       setIsOptimizing(true);
       setOptimizeWarnings([]);
+      setMultiTripPlans([]);
+      setUnplacedItems([]);
+      setCurrentTripIndex(0);
+      
       const result = await optimizeLoading(selectedVanId, cargoItems);
       
+      if (result.warnings && result.warnings.length > 0) {
+        setOptimizeWarnings(result.warnings);
+      }
+
       if (result.success && result.plan) {
         setLoadingPlan(result.plan);
+        setMultiTripPlans([{ tripNumber: 1, plan: result.plan, items: cargoItems }]);
         setOptimizeWarnings(result.warnings || []);
       } else {
-        alert('Falha na otimização');
+        setLoadingPlan(null);
+
+        const errorMsg = result.warnings && result.warnings.length > 0
+          ? result.warnings.join('\n')
+          : 'Falha desconhecida (sem detalhes do servidor)';
+          
+        alert(`Não foi possível gerar o plano:\n\n${errorMsg}`);
       }
     } catch (err) {
       console.error('Optimization failed:', err);
-      alert('Erro ao gerar plano de carregamento');
+      alert('Erro de comunicação: ' + err.message);
     } finally {
       setIsOptimizing(false);
     }
+  }
+  
+  // Multi-trip planning - splits items into multiple van loads
+  async function handleGenerateMultiTripPlan() {
+    if (!selectedVanId || cargoItems.length === 0) return;
+    
+    try {
+      setIsOptimizing(true);
+      setOptimizeWarnings([]);
+      setMultiTripPlans([]);
+      setUnplacedItems([]);
+      
+      let remainingItems = [...cargoItems];
+      const trips = [];
+      let tripNumber = 1;
+      const allWarnings = [];
+      
+      const unfittableItems = []; // Items that can never fit in the van
+      
+      while (remainingItems.length > 0 && tripNumber <= 50) { // Max 50 trips safety
+        const result = await optimizeLoading(selectedVanId, remainingItems);
+        
+        if (result.success && result.plan && result.plan.items.length > 0) {
+          // Find which items were placed
+          const placedDescriptions = result.plan.items.map(i => i.item.description);
+          const placedItems = remainingItems.filter(item => 
+            placedDescriptions.includes(item.description)
+          );
+          
+          // Remove placed items from remaining (match by index to handle duplicates)
+          const placedIndices = [];
+          for (const placed of result.plan.items) {
+            const idx = remainingItems.findIndex((item, i) => 
+              !placedIndices.includes(i) && item.description === placed.item.description
+            );
+            if (idx !== -1) placedIndices.push(idx);
+          }
+          
+          remainingItems = remainingItems.filter((_, i) => !placedIndices.includes(i));
+          
+          trips.push({
+            tripNumber,
+            plan: result.plan,
+            items: placedItems,
+            warnings: result.warnings || []
+          });
+          
+          // Only add warnings about items that truly can't fit (not "could not be placed" warnings)
+          if (result.warnings) {
+            const importantWarnings = result.warnings.filter(w => 
+              w.includes('cannot fit in van') || w.includes('demasiado grande')
+            );
+            allWarnings.push(...importantWarnings.map(w => `Viagem ${tripNumber}: ${w}`));
+          }
+          
+          tripNumber++;
+        } else {
+          // No items could be placed - check if they're simply too big for the van
+          // An item is unfittable if ALL its rotations exceed van dimensions
+          const van = vans.find(v => v.id === selectedVanId);
+          if (van) {
+            const stillFittable = [];
+            for (const item of remainingItems) {
+              const dims = [item.length_mm, item.width_mm, item.height_mm].sort((a, b) => a - b);
+              const vanDims = [van.length_mm, van.width_mm, van.height_mm].sort((a, b) => a - b);
+              // Check if smallest fits in smallest, etc.
+              const canFit = item.rotation_allowed 
+                ? (dims[0] <= vanDims[0] && dims[1] <= vanDims[1] && dims[2] <= vanDims[2])
+                : (item.length_mm <= van.length_mm && item.width_mm <= van.width_mm && item.height_mm <= van.height_mm);
+              
+              if (canFit) {
+                stillFittable.push(item);
+              } else {
+                unfittableItems.push(item);
+                allWarnings.push(`Item '${item.description}' (${item.length_mm}×${item.width_mm}×${item.height_mm}mm) é demasiado grande para a carrinha`);
+              }
+            }
+            remainingItems = stillFittable;
+            if (remainingItems.length === 0) break;
+          } else {
+            allWarnings.push(`Não foi possível colocar ${remainingItems.length} item(s)`);
+            break;
+          }
+        }
+      }
+      
+      // Combine remaining + unfittable items
+      const allUnplaced = [...remainingItems, ...unfittableItems];
+      
+      if (trips.length > 0) {
+        setMultiTripPlans(trips);
+        setCurrentTripIndex(0);
+        setLoadingPlan(trips[0].plan);
+        setUnplacedItems(allUnplaced);
+        setOptimizeWarnings(allWarnings);
+      } else if (unfittableItems.length > 0) {
+        // All items are too big for the van
+        setUnplacedItems(allUnplaced);
+        setOptimizeWarnings(allWarnings);
+        alert(`Nenhum item cabe na carrinha selecionada. ${unfittableItems.length} item(s) são demasiado grandes.`);
+      } else {
+        alert('Não foi possível criar nenhum plano de carregamento');
+      }
+    } catch (err) {
+      console.error('Multi-trip optimization failed:', err);
+      alert('Erro ao gerar plano multi-viagem');
+    } finally {
+      setIsOptimizing(false);
+    }
+  }
+  
+  // Export/Print loading order
+  function handleExportLoadingOrder() {
+    const van = vans.find(v => v.id === selectedVanId);
+    if (!van || multiTripPlans.length === 0) {
+      alert('Sem plano para imprimir. Gere um plano primeiro.');
+      return;
+    }
+    
+    try {
+      const printContent = generatePrintableLoadingOrder(van, multiTripPlans, cargoItems);
+      
+      // Create a hidden iframe for printing (works better in Tauri)
+      const printFrame = document.createElement('iframe');
+      printFrame.style.position = 'fixed';
+      printFrame.style.right = '0';
+      printFrame.style.bottom = '0';
+      printFrame.style.width = '0';
+      printFrame.style.height = '0';
+      printFrame.style.border = '0';
+      document.body.appendChild(printFrame);
+      
+      const frameDoc = printFrame.contentWindow.document;
+      frameDoc.open();
+      frameDoc.write(printContent);
+      frameDoc.close();
+      
+      // Wait for content to load then print
+      printFrame.onload = () => {
+        try {
+          printFrame.contentWindow.focus();
+          printFrame.contentWindow.print();
+        } catch (e) {
+          console.error('Print error:', e);
+          // Fallback: open in new window
+          const newWindow = window.open('', '_blank');
+          if (newWindow) {
+            newWindow.document.write(printContent);
+            newWindow.document.close();
+            newWindow.focus();
+            newWindow.print();
+          } else {
+            alert('Não foi possível abrir a janela de impressão. Verifique se os popups estão permitidos.');
+          }
+        }
+        // Clean up after a delay
+        setTimeout(() => document.body.removeChild(printFrame), 1000);
+      };
+    } catch (err) {
+      console.error('Export failed:', err);
+      alert('Erro ao exportar: ' + err.message);
+    }
+  }
+  
+  function generatePrintableLoadingOrder(van, trips, allItems) {
+    const date = new Date().toLocaleDateString('pt-PT');
+    const time = new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+    
+    let html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Plano de Carregamento - ${date}</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { font-family: Arial, sans-serif; font-size: 12px; padding: 20px; }
+          .header { text-align: center; margin-bottom: 20px; border-bottom: 2px solid #333; padding-bottom: 10px; }
+          .header h1 { font-size: 18px; margin-bottom: 5px; }
+          .header p { color: #666; }
+          .van-info { background: #f5f5f5; padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+          .van-info h3 { margin-bottom: 5px; }
+          .trip { page-break-inside: avoid; margin-bottom: 25px; border: 1px solid #333; padding: 15px; }
+          .trip-header { background: #333; color: white; padding: 8px 12px; margin: -15px -15px 15px -15px; }
+          .trip-header h2 { font-size: 14px; }
+          .stats { display: flex; gap: 20px; margin-bottom: 10px; padding: 10px; background: #f9f9f9; }
+          .stat { text-align: center; }
+          .stat-value { font-size: 16px; font-weight: bold; }
+          .stat-label { font-size: 10px; color: #666; }
+          .items-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          .items-table th, .items-table td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+          .items-table th { background: #eee; font-size: 11px; }
+          .items-table tr:nth-child(even) { background: #fafafa; }
+          .order-num { background: #333; color: white; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: bold; font-size: 11px; }
+          .fragile { color: #d32f2f; font-weight: bold; }
+          .loading-instructions { margin-top: 15px; padding: 10px; background: #e8f5e9; border-left: 4px solid #4caf50; }
+          .loading-instructions h4 { margin-bottom: 5px; }
+          .loading-instructions ol { margin-left: 20px; }
+          .footer { margin-top: 30px; text-align: center; font-size: 10px; color: #999; border-top: 1px solid #ccc; padding-top: 10px; }
+          .summary { background: #fff3cd; padding: 15px; margin-bottom: 20px; border: 1px solid #ffc107; }
+          .summary h3 { margin-bottom: 10px; }
+          @media print { 
+            .trip { page-break-inside: avoid; }
+            body { padding: 10px; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>PLANO DE CARREGAMENTO</h1>
+          <p>${date} às ${time}</p>
+        </div>
+        
+        <div class="van-info">
+          <h3>${van.name}</h3>
+          <p>Dimensões: ${van.length_mm} × ${van.width_mm} × ${van.height_mm} mm</p>
+          ${van.max_weight_kg ? `<p>Peso máximo: ${van.max_weight_kg} kg</p>` : ''}
+        </div>
+        
+        <div class="summary">
+          <h3>Resumo</h3>
+          <p><strong>Total de Viagens:</strong> ${trips.length}</p>
+          <p><strong>Total de Itens:</strong> ${allItems.length}</p>
+        </div>
+    `;
+    
+    trips.forEach((trip, idx) => {
+      const itemsInTrip = trip.plan.items;
+      html += `
+        <div class="trip">
+          <div class="trip-header">
+            <h2>VIAGEM ${trip.tripNumber} de ${trips.length}</h2>
+          </div>
+          
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-value">${itemsInTrip.length}</div>
+              <div class="stat-label">Itens</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value">${trip.plan.utilization_percent.toFixed(1)}%</div>
+              <div class="stat-label">Ocupação</div>
+            </div>
+          </div>
+          
+          <table class="items-table">
+            <thead>
+              <tr>
+                <th style="width: 40px;">#</th>
+                <th>Descrição</th>
+                <th>Dimensões (mm)</th>
+                <th>Posição</th>
+                <th>Notas</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itemsInTrip.map((item, i) => `
+                <tr>
+                  <td><span class="order-num">${i + 1}</span></td>
+                  <td>${item.item.description}</td>
+                  <td>${item.placed_length || item.item.length_mm} × ${item.placed_width || item.item.width_mm} × ${item.placed_height || item.item.height_mm}</td>
+                  <td>X:${item.position.x} Y:${item.position.y} Z:${item.position.z}</td>
+                  <td>${item.item.fragile ? '<span class="fragile">FRÁGIL</span>' : ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          
+          <div class="loading-instructions">
+            <h4>Ordem de Carregamento:</h4>
+            <ol>
+              ${itemsInTrip.map((item, i) => `
+                <li>${item.item.description} ${item.item.fragile ? '(FRÁGIL - cuidado!)' : ''}</li>
+              `).join('')}
+            </ol>
+          </div>
+        </div>
+      `;
+    });
+    
+    html += `
+        <div class="footer">
+          <p>Gerado automaticamente pelo RetLister</p>
+        </div>
+      </body>
+      </html>
+    `;
+    
+    return html;
   }
 
   useEffect(() => { refresh(); }, []);
@@ -935,7 +1244,7 @@ async function fetchEstado() {
                         </div>
                         <div style={{display: 'flex', gap: '5px'}}>
                           <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleEditVan(van); }} title="Editar">✎</button>
-                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleDeleteVan(van.id); }} title="Desativar">🗑</button>
+                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleDeleteVan(van.id); }} title="Desativar">X</button>
                         </div>
                       </div>
                     </div>
@@ -946,9 +1255,121 @@ async function fetchEstado() {
 
             {/* Cargo Items */}
             <div className="panel" style={{flex: 1, display: 'flex', flexDirection: 'column'}}>
-              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '5px'}}>
                 <h3>Itens a Carregar</h3>
-                <button className="btn btn-primary" disabled={!selectedVanId} onClick={handleAddCargo}>+ Adicionar Item</button>
+                <div style={{display: 'flex', gap: '5px', flexWrap: 'wrap'}}>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+                    const testCabinets = [
+                      { description: 'Armário Grande', length_mm: 800, width_mm: 600, height_mm: 2000, fragile: false, stackable: true, rotation_allowed: true, color: '#8B4513' },
+                      { description: 'Cómoda', length_mm: 1000, width_mm: 500, height_mm: 800, fragile: false, stackable: true, rotation_allowed: true, color: '#DEB887' },
+                      { description: 'Mesa de Cabeceira', length_mm: 450, width_mm: 400, height_mm: 550, fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E' },
+                      { description: 'Mesa de Cabeceira 2', length_mm: 450, width_mm: 400, height_mm: 550, fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E' },
+                      { description: 'Estante Vidro', length_mm: 900, width_mm: 350, height_mm: 1800, fragile: false, stackable: true, rotation_allowed: true, color: '#87CEEB' },
+                      { description: 'Aparador', length_mm: 1200, width_mm: 400, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#A0522D' },
+                      { description: 'Caixa 1', length_mm: 500, width_mm: 400, height_mm: 400, fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F' },
+                      { description: 'Caixa 2', length_mm: 500, width_mm: 400, height_mm: 400, fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F' },
+                      { description: 'Caixa Frágil', length_mm: 400, width_mm: 400, height_mm: 350, fragile: true, stackable: false, rotation_allowed: true, color: '#FF6347' },
+                    ];
+                    setCargoItems(testCabinets);
+                  }}>Teste</button>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+  const fullLoad = [
+  // --- BIG FURNITURE (The Anchors) ---
+  { description: 'Sofá 3 Lugares', length_mm: 2100, width_mm: 900, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#5D4037' },
+  { description: 'Colchão Casal', length_mm: 1900, width_mm: 1400, height_mm: 250, fragile: false, stackable: true, rotation_allowed: true, color: '#F5F5F5' },
+  { description: 'Estrutura Cama', length_mm: 2000, width_mm: 300, height_mm: 200, fragile: false, stackable: true, rotation_allowed: true, color: '#8D6E63' },
+  
+  // --- TALL ITEMS (Must Lay Down) ---
+  { description: 'Roupeiro PAX 1', length_mm: 1000, width_mm: 600, height_mm: 2360, fragile: false, stackable: true, rotation_allowed: true, color: '#FFFFFF' },
+  { description: 'Roupeiro PAX 2', length_mm: 1000, width_mm: 600, height_mm: 2360, fragile: false, stackable: true, rotation_allowed: true, color: '#FFFFFF' },
+  { description: 'Frigorífico Combinado', length_mm: 600, width_mm: 650, height_mm: 1850, fragile: false, stackable: true, rotation_allowed: true, color: '#B0BEC5' },
+
+  // --- APPLIANCES & HEAVY ---
+  { description: 'Máquina Lavar', length_mm: 600, width_mm: 600, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#ECEFF1' },
+  { description: 'Máquina Secar', length_mm: 600, width_mm: 600, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#ECEFF1' },
+
+  // --- MEDIUM FURNITURE ---
+  { description: 'Cómoda Malm', length_mm: 800, width_mm: 480, height_mm: 780, fragile: false, stackable: true, rotation_allowed: true, color: '#8B4513' },
+  { description: 'Secretária', length_mm: 1200, width_mm: 600, height_mm: 750, fragile: false, stackable: true, rotation_allowed: true, color: '#A1887F' },
+  { description: 'Estante Billy', length_mm: 800, width_mm: 280, height_mm: 1060, fragile: false, stackable: true, rotation_allowed: true, color: '#5D4037' },
+
+  // --- CHAIRS ---
+  { description: 'Cadeira Jantar 1', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 2', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 3', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 4', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+
+  // --- LARGE BOXES ---
+  ...Array.from({ length: 15 }).map((_, i) => ({
+    description: `Caixa Grande ${i + 1}`,
+    length_mm: 600, width_mm: 400, height_mm: 400,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F'
+  })),
+
+  // --- MEDIUM BOXES ---
+  ...Array.from({ length: 10 }).map((_, i) => ({
+    description: `Caixa Média ${i + 1}`,
+    length_mm: 500, width_mm: 300, height_mm: 300,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E'
+  })),
+
+  // --- "FRAGILE" BOXES (now non-fragile & stackable) ---
+  ...Array.from({ length: 5 }).map((_, i) => ({
+    description: `Frágil ${i + 1}`,
+    length_mm: 400, width_mm: 300, height_mm: 300,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#FF6347'
+  }))
+];
+
+  setCargoItems(fullLoad);
+}}>Teste Carga Completa</button>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+                    // Large test - multiple trips needed
+                    // Items are sized to fit in typical vans when laid down
+                    const largeTest = [];
+                    const colors = ['#8B4513', '#DEB887', '#D2691E', '#A0522D', '#CD853F', '#BC8F8F', '#F4A460', '#DAA520'];
+                    for (let i = 1; i <= 15; i++) {
+                      // Wardrobes: max dimension ~1800mm so they fit when laid down
+                      // Height 1600-1800mm, when laid down fits in van length
+                      largeTest.push({ 
+                        description: `Armário ${i}`, 
+                        length_mm: 600 + Math.floor(Math.random() * 300), // 600-900mm
+                        width_mm: 450 + Math.floor(Math.random() * 150), // 450-600mm
+                        height_mm: 1600 + Math.floor(Math.random() * 200), // 1600-1800mm
+                        fragile: false, 
+                        stackable: true, 
+                        rotation_allowed: true, 
+                        color: colors[i % colors.length] 
+                      });
+                    }
+                    for (let i = 1; i <= 10; i++) {
+                      largeTest.push({ 
+                        description: `Cómoda ${i}`, 
+                        length_mm: 800 + Math.floor(Math.random() * 300), 
+                        width_mm: 400 + Math.floor(Math.random() * 200), 
+                        height_mm: 700 + Math.floor(Math.random() * 200), 
+                        fragile: false, 
+                        stackable: true, 
+                        rotation_allowed: true, 
+                        color: colors[(i + 3) % colors.length] 
+                      });
+                    }
+                    for (let i = 1; i <= 20; i++) {
+                      largeTest.push({ 
+                        description: `Caixa ${i}`, 
+                        length_mm: 400 + Math.floor(Math.random() * 200), 
+                        width_mm: 300 + Math.floor(Math.random() * 200), 
+                        height_mm: 300 + Math.floor(Math.random() * 200), 
+                        fragile: i <= 3,
+                        stackable: i > 3, // Fragile boxes can't be stacked on
+                        rotation_allowed: true, 
+                        color: i <= 3 ? '#FF6347' : '#CD853F' 
+                      });
+                    }
+                    setCargoItems(largeTest);
+                  }} title="45 itens - necessita múltiplas viagens">Teste Grande</button>
+                  <button className="btn btn-primary" disabled={!selectedVanId} onClick={handleAddCargo}>+ Adicionar</button>
+                </div>
               </div>
               {cargoItems.length === 0 ? (
                 <div className="empty-state" style={{padding: '20px', textAlign: 'center', color: '#666'}}>
@@ -965,8 +1386,7 @@ async function fetchEstado() {
                           <strong>{item.description || `Item ${idx + 1}`}</strong>
                           <div className="small muted">
                             {item.length_mm}×{item.width_mm}×{item.height_mm} mm
-                            {item.weight_kg && ` | ${item.weight_kg}kg`}
-                            {item.fragile && ' | 🔴 Frágil'}
+                            {item.fragile && ' | Frágil'}
                           </div>
                         </div>
                         <div style={{display: 'flex', gap: '5px'}}>
@@ -979,14 +1399,23 @@ async function fetchEstado() {
                 </div>
               )}
               {cargoItems.length > 0 && selectedVanId && (
-                <button 
-                  className="btn btn-success" 
-                  style={{marginTop: '10px'}} 
-                  onClick={handleGeneratePlan}
-                  disabled={isOptimizing}
-                >
-                  {isOptimizing ? 'A processar...' : 'Gerar Plano de Carregamento'}
-                </button>
+                <div style={{marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '5px'}}>
+                  <button 
+                    className="btn btn-success" 
+                    onClick={handleGeneratePlan}
+                    disabled={isOptimizing}
+                  >
+                    {isOptimizing ? 'A processar...' : 'Gerar Plano de Carregamento'}
+                  </button>
+                  <button 
+                    className="btn" 
+                    onClick={handleGenerateMultiTripPlan}
+                    disabled={isOptimizing}
+                    title="Divide automaticamente os itens em múltiplas viagens se não couberem numa só"
+                  >
+                    {isOptimizing ? 'A processar...' : 'Plano Multi-Viagem'}
+                  </button>
+                </div>
               )}
               
               {/* Warnings display */}
@@ -1025,12 +1454,83 @@ async function fetchEstado() {
             ) : (
               <div style={{display: 'flex', flexDirection: 'column', height: '100%'}}>
                 <div style={{padding: '20px', borderBottom: '1px solid #ddd'}}>
-                  <div className="panel-header" style={{marginBottom: '15px'}}>
+                  <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px'}}>
                     <h3>Plano de Carregamento</h3>
+                    <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+                      {/* Trip navigation for multi-trip plans */}
+                      {multiTripPlans.length > 1 && (
+                        <div style={{display: 'flex', alignItems: 'center', gap: '5px', background: '#e3f2fd', padding: '5px 10px', borderRadius: '4px'}}>
+                          <button 
+                            className="btn-icon" 
+                            onClick={() => {
+                              const newIdx = Math.max(0, currentTripIndex - 1);
+                              setCurrentTripIndex(newIdx);
+                              setLoadingPlan(multiTripPlans[newIdx].plan);
+                            }}
+                            disabled={currentTripIndex === 0}
+                          >
+                            ◀
+                          </button>
+                          <span style={{fontWeight: 'bold', minWidth: '100px', textAlign: 'center'}}>
+                            Viagem {currentTripIndex + 1} / {multiTripPlans.length}
+                          </span>
+                          <button 
+                            className="btn-icon" 
+                            onClick={() => {
+                              const newIdx = Math.min(multiTripPlans.length - 1, currentTripIndex + 1);
+                              setCurrentTripIndex(newIdx);
+                              setLoadingPlan(multiTripPlans[newIdx].plan);
+                            }}
+                            disabled={currentTripIndex === multiTripPlans.length - 1}
+                          >
+                            ▶
+                          </button>
+                        </div>
+                      )}
+                      <button 
+                        className="btn" 
+                        onClick={handleExportLoadingOrder}
+                        title="Imprimir ordem de carregamento"
+                      >
+                        🖨 Imprimir
+                      </button>
+                      <button 
+                        className="btn" 
+                        onClick={() => {
+                          setLoadingPlan(null);
+                          setMultiTripPlans([]);
+                          setCurrentTripIndex(0);
+                          setUnplacedItems([]);
+                        }}
+                      >
+                        Limpar
+                      </button>
+                    </div>
                   </div>
                   
+                  {/* Multi-trip summary */}
+                  {multiTripPlans.length > 1 && (
+                    <div style={{marginBottom: '15px', padding: '10px', background: '#e8f5e9', borderRadius: '4px', border: '1px solid #4caf50'}}>
+                      <strong style={{color: '#2e7d32'}}>Plano Multi-Viagem:</strong>
+                      <span style={{marginLeft: '10px'}}>
+                        {multiTripPlans.length} viagens necessárias para {cargoItems.length} itens
+                      </span>
+                      {unplacedItems.length > 0 && (
+                        <span style={{marginLeft: '10px', color: '#d32f2f'}}>
+                          ({unplacedItems.length} item(s) não coube(m))
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  
                   {/* Stats */}
-                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px'}}>
+                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '10px'}}>
+                    {multiTripPlans.length > 1 && (
+                      <div className="stat-box" style={{padding: '10px', background: '#e3f2fd', border: '1px solid #1976d2', borderRadius: '4px'}}>
+                        <div className="small muted">Viagem</div>
+                        <div style={{fontSize: '20px', fontWeight: 'bold', color: '#1976d2'}}>{currentTripIndex + 1} / {multiTripPlans.length}</div>
+                      </div>
+                    )}
                     <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
                       <div className="small muted">Items</div>
                       <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.items.length}</div>
@@ -1490,15 +1990,16 @@ async function fetchEstado() {
             <form onSubmit={(e) => {
               e.preventDefault();
               const formData = new FormData(e.target);
+              const isFragile = formData.get('fragile') === 'on';
               handleSaveCargo({
                 description: formData.get('description'),
                 length_mm: Number(formData.get('length_mm')),
                 width_mm: Number(formData.get('width_mm')),
                 height_mm: Number(formData.get('height_mm')),
-                weight_kg: Number(formData.get('weight_kg')) || 1,
-                fragile: formData.get('fragile') === 'on',
+                weight_kg: 1, // Weight not used but kept for API compatibility
+                fragile: isFragile,
                 rotation_allowed: formData.get('rotation_allowed') === 'on',
-                stackable: formData.get('stackable') === 'on',
+                stackable: !isFragile, // Fragile items cannot be stacked on
                 color: formData.get('color') || '#74c0fc'
               });
             }}>
@@ -1551,19 +2052,6 @@ async function fetchEstado() {
                   />
                 </label>
                 <label>
-                  Peso (kg):
-                  <input 
-                    type="number" 
-                    name="weight_kg" 
-                    defaultValue={editingCargo?.weight_kg || ''} 
-                    required
-                    min="0.1" 
-                    max="500" 
-                    step="0.1" 
-                    placeholder="80" 
-                  />
-                </label>
-                <label>
                   Cor (visualização):
                   <input 
                     type="color" 
@@ -1580,7 +2068,7 @@ async function fetchEstado() {
                     defaultChecked={editingCargo?.fragile || false}
                     style={{accentColor: '#d32f2f', margin: 0, flexShrink: 0}}
                   />
-                  <span style={{whiteSpace: 'nowrap'}}>Frágil</span>
+                  <span style={{whiteSpace: 'nowrap'}}>Frágil (não pode ter itens em cima)</span>
                 </label>
                 <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
                   <input 
@@ -1590,15 +2078,6 @@ async function fetchEstado() {
                     style={{accentColor: '#1976d2', margin: 0, flexShrink: 0}}
                   />
                   <span style={{whiteSpace: 'nowrap'}}>Permitir rotação</span>
-                </label>
-                <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
-                  <input 
-                    type="checkbox" 
-                    name="stackable" 
-                    defaultChecked={editingCargo?.stackable !== false}
-                    style={{accentColor: '#388e3c', margin: 0, flexShrink: 0}}
-                  />
-                  <span style={{whiteSpace: 'nowrap'}}>Empilhável</span>
                 </label>
               </div>
               <div className="modal-actions" style={{marginTop: '12px'}}>

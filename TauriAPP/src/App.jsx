@@ -6,7 +6,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 async function optimizeCuts(cuttingList, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
-  
   const cuts = cuttingList.map(cut => ({
     width_mm: parseInt(cut.width_mm),
     height_mm: parseInt(cut.height_mm),
@@ -14,35 +13,12 @@ async function optimizeCuts(cuttingList, settings) {
     material: cut.material,
     quantity: parseInt(cut.quantity)
   }));
-  
-  console.log('Sending cuts to API:', cuts);
-  
   const response = await optimizeCutsAPI(cuts, kerfWidth, minRemainderWidth, minRemainderHeight);
-  
-  console.log('Received response from API:', response);
-  
-  if (!response || !response.used_planks) {
-    throw new Error('Invalid response from server');
-  }
-  
+  if (!response || !response.used_planks) throw new Error('Invalid response');
   return {
     usedPlanks: response.used_planks.map(plank => ({
-      resto: {
-        id: plank.resto_id,
-        width_mm: plank.width_mm,
-        height_mm: plank.height_mm,
-        thickness_mm: plank.thickness_mm,
-        material: plank.material
-      },
-      cuts: plank.cuts.map(cut => ({
-        x: cut.x,
-        y: cut.y,
-        width_mm: cut.width,
-        height_mm: cut.height,
-        rotated: cut.rotated,
-        material: cut.material,
-        thickness_mm: cut.thickness_mm
-      })),
+      resto: { id: plank.resto_id, width_mm: plank.width_mm, height_mm: plank.height_mm, thickness_mm: plank.thickness_mm, material: plank.material },
+      cuts: plank.cuts.map(cut => ({ x: cut.x, y: cut.y, width_mm: cut.width, height_mm: cut.height, rotated: cut.rotated, material: cut.material, thickness_mm: cut.thickness_mm })),
       wastePercent: plank.waste_percent
     })),
     unplacedCuts: (response.unplaced_cuts || []).map(([idx, cut]) => cut),
@@ -75,6 +51,17 @@ function IconTrash(props){
   );
 }
 
+function getHumanLocationUI(item, van) {
+  if (!item?.position) return "-";
+  const { x, y, z } = item.position;
+  const { placed_width } = item;
+  
+  let h = y === 0 ? "Chão" : y < 1000 ? "Nível Médio" : "Topo";
+  let d = x === 0 ? "Fundo" : x < van.length_mm / 2 ? "Meio" : "Frente";
+  let s = z === 0 ? "Esq" : (z + placed_width >= van.width_mm) ? "Dir" : "Centro";
+  return `${h}, ${d}, ${s}`;
+}
+
 function IconGear(props){
   return (
     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden {...props}>
@@ -97,6 +84,7 @@ function App() {
   const [filterMaterial, setFilterMaterial] = useState("");
   const [filterThickness, setFilterThickness] = useState("");
 
+
   const [vans, setVans] = useState([]);
   const [selectedVanId, setSelectedVanId] = useState(null);
   const [cargoItems, setCargoItems] = useState([]);
@@ -104,6 +92,12 @@ function App() {
   const [optimizeWarnings, setOptimizeWarnings] = useState([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [vansLoading, setVansLoading] = useState(true);
+  
+  // Multi-trip planning
+  const [multiTripPlans, setMultiTripPlans] = useState([]);
+  const [currentTripIndex, setCurrentTripIndex] = useState(0);
+  const [unplacedItems, setUnplacedItems] = useState([]);
+  
 
   const [estadoData, setEstadoData] = useState({
     mainServer: { status: 'unknown', uptime: 0 },
@@ -367,26 +361,555 @@ async function fetchEstado() {
     }
   }
 
-  async function handleGeneratePlan() {
+async function handleGeneratePlan() {
     if (!selectedVanId || cargoItems.length === 0) return;
     
     try {
       setIsOptimizing(true);
       setOptimizeWarnings([]);
+      setMultiTripPlans([]);
+      setUnplacedItems([]); // Clear previous
+      setCurrentTripIndex(0);
+      
       const result = await optimizeLoading(selectedVanId, cargoItems);
       
       if (result.success && result.plan) {
         setLoadingPlan(result.plan);
+        setUnplacedItems(result.unplaced_items || []); // Capture leftovers
+        setMultiTripPlans([{ tripNumber: 1, plan: result.plan, items: cargoItems }]); // Treat single as trip 1
         setOptimizeWarnings(result.warnings || []);
       } else {
-        alert('Falha na otimização');
+        setLoadingPlan(null);
+        const errorMsg = result.warnings && result.warnings.length > 0
+          ? result.warnings.join('\n')
+          : 'Falha desconhecida (sem detalhes do servidor)';
+        alert(`Não foi possível gerar o plano:\n\n${errorMsg}`);
       }
     } catch (err) {
       console.error('Optimization failed:', err);
-      alert('Erro ao gerar plano de carregamento');
+      let msg = err.message || "Erro desconhecido";
+      alert(`Erro no servidor:\n${msg}`);
     } finally {
       setIsOptimizing(false);
     }
+  }
+  
+  // Multi-trip planning - splits items into multiple van loads
+  async function handleGenerateMultiTripPlan() {
+    if (!selectedVanId || cargoItems.length === 0) return;
+    
+    try {
+      setIsOptimizing(true);
+      setOptimizeWarnings([]);
+      setMultiTripPlans([]);
+      setUnplacedItems([]);
+      
+      let itemsToPack = [...cargoItems];
+      const trips = [];
+      let tripNumber = 1;
+      const allWarnings = [];
+      
+      // Loop until all items packed or we hit safety limit
+      while (itemsToPack.length > 0 && tripNumber <= 10) {
+        const result = await optimizeLoading(selectedVanId, itemsToPack);
+        
+        if (result.success && result.plan) {
+          // Add this trip
+          trips.push({
+            tripNumber,
+            plan: result.plan,
+            items: result.plan.items.map(pi => pi.item),
+            warnings: result.warnings || []
+          });
+          
+          if (result.warnings) allWarnings.push(...result.warnings);
+          
+          // Next iteration tries to pack ONLY what was left over
+          const leftovers = result.unplaced_items || [];
+          
+          // Optimization: If leftovers count matches input count, we made NO progress. Stop to avoid infinite loop.
+          if (leftovers.length === itemsToPack.length) {
+             allWarnings.push(`Impossível carregar os restantes ${leftovers.length} itens (demasiado grandes?)`);
+             setUnplacedItems(leftovers);
+             break;
+          }
+          
+          itemsToPack = leftovers;
+          tripNumber++;
+        } else {
+          allWarnings.push("Erro ao calcular uma das viagens.");
+          break;
+        }
+      }
+      
+      if (trips.length > 0) {
+        setMultiTripPlans(trips);
+        setCurrentTripIndex(0);
+        setLoadingPlan(trips[0].plan); // Show first trip
+        setOptimizeWarnings(allWarnings);
+      } else {
+        alert('Não foi possível gerar nenhum plano válido.');
+      }
+      
+    } catch (err) {
+      console.error('Multi-trip optimization failed:', err);
+      alert('Erro ao gerar plano multi-viagem: ' + err.message);
+    } finally {
+      setIsOptimizing(false);
+    }
+  }
+  
+  // Export/Print loading order
+function generatePrintableLoadingOrder(van, multiTripPlans, allCargoItems) {
+  
+  // Lógica para encontrar o item que está POR BAIXO
+  const findSupportingItem = (item, allTripItems) => {
+    // Se está no chão (y=0) ou em cima da cava da roda (y ~ 300-400 e sem item por baixo), não tem "pai"
+    if (item.position.y === 0) return null;
+
+    let bestSupport = null;
+    let maxOverlapArea = 0;
+
+    const myX = item.position.x;
+    const myZ = item.position.z;
+    const myL = item.placed_length;
+    const myW = item.placed_width;
+
+    for (const other of allTripItems) {
+      if (other === item) continue;
+
+      // Verifica se o 'other' está imediatamente abaixo (com margem de erro de 1mm)
+      const otherTop = other.position.y + other.placed_height;
+      if (Math.abs(otherTop - item.position.y) > 5) continue;
+
+      // Verifica se há sobreposição física (colisão 2D vista de cima)
+      const otherX = other.position.x;
+      const otherZ = other.position.z;
+      const otherL = other.placed_length;
+      const otherW = other.placed_width;
+
+      const overlapX = Math.max(0, Math.min(myX + myL, otherX + otherL) - Math.max(myX, otherX));
+      const overlapZ = Math.max(0, Math.min(myZ + myW, otherZ + otherW) - Math.max(myZ, otherZ));
+      
+      const area = overlapX * overlapZ;
+
+      // Se sobrepõe e é a maior área encontrada até agora, é o nosso suporte principal
+      if (area > 0 && area > maxOverlapArea) {
+        maxOverlapArea = area;
+        bestSupport = other;
+      }
+    }
+    
+    // Só consideramos suporte se cobrir uma parte significativa (opcional, aqui aceitamos qualquer apoio)
+    return bestSupport;
+  };
+
+  const getHumanLocation = (item, vanLength, vanWidth, allItemsInTrip) => {
+    const { x, y, z } = item.position;
+    const { placed_width } = item;
+    
+    let parts = [];
+    
+    // 1. ALTURA (A GRANDE MUDANÇA)
+    const support = findSupportingItem(item, allItemsInTrip);
+    
+    if (y === 0) {
+      parts.push("No Chão");
+    } else if (support) {
+      // Se encontrou suporte, dizemos o nome!
+      parts.push(`Em cima de "${support.item.description}"`);
+    } else if (y > 0 && y < van.wheel_well_height_mm + 50) {
+       // Se está baixo mas não no chão (provavelmente cava da roda)
+       parts.push("Sobre a Roda/Cava");
+    } else if (y < 1000) {
+      parts.push("Nível Médio");
+    } else {
+      parts.push("Topo");
+    }
+
+    // 2. PROFUNDIDADE (Fundo -> Porta)
+    if (x === 0) parts.push("Fundo");
+    else if (x < vanLength * 0.3) parts.push("Fundo");
+    else if (x < vanLength * 0.6) parts.push("Meio");
+    else parts.push("Porta");
+
+    // 3. LADO (Esquerda -> Direita)
+    if (z === 0) parts.push("Esq");
+    else if (z + placed_width >= vanWidth) parts.push("Dir");
+    else parts.push("Centro");
+
+    return parts.join(" - ");
+  };
+
+  // --- GERAÇÃO DO HTML ---
+  const tripsHtml = multiTripPlans.map((trip, tripIndex) => {
+    // Ordenar para impressão: Do Fundo para a Frente (X crescente), Chão para o Teto (Y crescente)
+    // Nota: Para carregar a carrinha, queremos o inverso (o que entra primeiro).
+    // Mas numa lista de conferência, geralmente lemos do fundo para a porta.
+    const sortedItems = [...trip.plan.items].sort((a, b) => {
+      // Agrupar por "paredes" (X semelhante)
+      const xDiff = a.position.x - b.position.x;
+      if (Math.abs(xDiff) > 100) return xDiff; 
+      
+      // Dentro da mesma "parede", do chão para cima
+      return a.position.y - b.position.y;
+    });
+
+    return `
+      <div class="trip-block">
+        <div class="trip-header">
+          <h2>Viagem ${trip.tripNumber} de ${multiTripPlans.length}</h2>
+          <div class="trip-stats">
+            <span>Itens: <strong>${trip.plan.items.length}</strong></span>
+            <span>Peso: <strong>${trip.plan.total_weight.toFixed(1)} kg</strong></span>
+            <span>Ocupação: <strong>${trip.plan.utilization_percent.toFixed(1)}%</strong></span>
+          </div>
+        </div>
+        
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 5%">#</th>
+              <th style="width: 35%">Item</th>
+              <th style="width: 20%">Dimensões (mm)</th>
+              <th style="width: 30%">Posição (Instrução)</th>
+              <th style="width: 10%">Notas</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sortedItems.map((item, idx) => `
+              <tr>
+                <td>${idx + 1}</td>
+                <td>
+                  <strong>${item.item.description}</strong>
+                  ${item.rotation && (item.rotation.x !== 0 || item.rotation.y !== 0) ? '<br><span class="muted small">(Rodado)</span>' : ''}
+                </td>
+                <td>${item.placed_length} x ${item.placed_width} x ${item.placed_height}</td>
+                <td style="font-weight: 500; color: #333;">
+                  ${getHumanLocation(item, van.length_mm, van.width_mm, trip.plan.items)}
+                </td>
+                <td class="${item.item.fragile ? 'fragile' : ''}">${item.item.fragile ? 'FRÁGIL' : ''}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="page-break"></div>
+    `;
+  }).join('');
+
+  // Identificar itens não carregados (global)
+  // (Lógica simplificada: assumimos que 'unplacedItems' já foi calculado no componente React e podia ser passado, 
+  // mas aqui geramos apenas com base no que foi planeado vs total)
+  
+  return `
+    <!DOCTYPE html>
+    <html lang="pt">
+    <head>
+      <meta charset="UTF-8">
+      <title>Plano de Carregamento - ${van.name}</title>
+      <style>
+        @page { size: A4; margin: 15mm; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; color: #333; font-size: 13px; }
+        h1 { border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; font-size: 24px; }
+        .trip-block { margin-bottom: 40px; }
+        .trip-header { background: #f0f4f8; padding: 15px; border-radius: 6px; margin-bottom: 15px; border-left: 5px solid #2196F3; }
+        .trip-header h2 { margin: 0 0 10px 0; font-size: 18px; }
+        .trip-stats { display: flex; gap: 20px; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+        th { background-color: #f2f2f2; font-weight: bold; }
+        tr:nth-child(even) { background-color: #fafafa; }
+        .fragile { color: #d32f2f; font-weight: bold; }
+        .muted { color: #666; font-size: 0.85em; }
+        .page-break { page-break-after: always; }
+        .page-break:last-child { page-break-after: auto; }
+        .footer { margin-top: 30px; font-size: 11px; color: #666; border-top: 1px solid #eee; padding-top: 10px; text-align: center; }
+        
+        @media print {
+          body { padding: 0; }
+          .trip-header { -webkit-print-color-adjust: exact; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>Ordem de Carregamento</h1>
+        <p><strong>Veículo:</strong> ${van.name} (${van.length_mm}x${van.width_mm}x${van.height_mm}mm)</p>
+        <p><strong>Data:</strong> ${new Date().toLocaleDateString('pt-PT')} ${new Date().toLocaleTimeString('pt-PT')}</p>
+      </div>
+
+      ${tripsHtml}
+
+      <div class="footer">
+        * A lista está ordenada por posição física (Fundo -> Porta). Para carregar, siga a ordem da lista.
+      </div>
+    </body>
+    </html>
+  `;
+}
+  
+  function generatePrintableLoadingOrder(van, trips, allItems) {
+    const date = new Date().toLocaleDateString('pt-PT');
+    const time = new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+    
+    let html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Plano de Carregamento - ${date}</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { font-family: Arial, sans-serif; font-size: 12px; padding: 20px; }
+          .header { text-align: center; margin-bottom: 20px; border-bottom: 2px solid #333; padding-bottom: 10px; }
+          .header h1 { font-size: 18px; margin-bottom: 5px; }
+          .header p { color: #666; }
+          .van-info { background: #f5f5f5; padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+          .van-info h3 { margin-bottom: 5px; }
+          .trip { page-break-inside: avoid; margin-bottom: 25px; border: 1px solid #333; padding: 15px; }
+          .trip-header { background: #333; color: white; padding: 8px 12px; margin: -15px -15px 15px -15px; }
+          .trip-header h2 { font-size: 14px; }
+          .stats { display: flex; gap: 20px; margin-bottom: 10px; padding: 10px; background: #f9f9f9; }
+          .stat { text-align: center; }
+          .stat-value { font-size: 16px; font-weight: bold; }
+          .stat-label { font-size: 10px; color: #666; }
+          .items-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          .items-table th, .items-table td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+          .items-table th { background: #eee; font-size: 11px; }
+          .items-table tr:nth-child(even) { background: #fafafa; }
+          .order-num { background: #333; color: white; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: bold; font-size: 11px; }
+          .fragile { color: #d32f2f; font-weight: bold; }
+          .loading-instructions { margin-top: 15px; padding: 10px; background: #e8f5e9; border-left: 4px solid #4caf50; }
+          .loading-instructions h4 { margin-bottom: 5px; }
+          .loading-instructions ol { margin-left: 20px; }
+          .footer { margin-top: 30px; text-align: center; font-size: 10px; color: #999; border-top: 1px solid #ccc; padding-top: 10px; }
+          .summary { background: #fff3cd; padding: 15px; margin-bottom: 20px; border: 1px solid #ffc107; }
+          .summary h3 { margin-bottom: 10px; }
+          @media print { 
+            .trip { page-break-inside: avoid; }
+            body { padding: 10px; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>PLANO DE CARREGAMENTO</h1>
+          <p>${date} às ${time}</p>
+        </div>
+        
+        <div class="van-info">
+          <h3>${van.name}</h3>
+          <p>Dimensões: ${van.length_mm} × ${van.width_mm} × ${van.height_mm} mm</p>
+          ${van.max_weight_kg ? `<p>Peso máximo: ${van.max_weight_kg} kg</p>` : ''}
+        </div>
+        
+        <div class="summary">
+          <h3>Resumo</h3>
+          <p><strong>Total de Viagens:</strong> ${trips.length}</p>
+          <p><strong>Total de Itens:</strong> ${allItems.length}</p>
+        </div>
+    `;
+    
+    trips.forEach((trip, idx) => {
+      const itemsInTrip = trip.plan.items;
+      html += `
+        <div class="trip">
+          <div class="trip-header">
+            <h2>VIAGEM ${trip.tripNumber} de ${trips.length}</h2>
+          </div>
+          
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-value">${itemsInTrip.length}</div>
+              <div class="stat-label">Itens</div>
+            </div>
+            <div class="stat">
+              <div class="stat-value">${trip.plan.utilization_percent.toFixed(1)}%</div>
+              <div class="stat-label">Ocupação</div>
+            </div>
+          </div>
+          
+          <table class="items-table">
+            <thead>
+              <tr>
+                <th style="width: 40px;">#</th>
+                <th>Descrição</th>
+                <th>Dimensões (mm)</th>
+                <th>Posição</th>
+                <th>Notas</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itemsInTrip.map((item, i) => `
+                <tr>
+                  <td><span class="order-num">${i + 1}</span></td>
+                  <td>${item.item.description}</td>
+                  <td>${item.placed_length || item.item.length_mm} × ${item.placed_width || item.item.width_mm} × ${item.placed_height || item.item.height_mm}</td>
+                  <td>X:${item.position.x} Y:${item.position.y} Z:${item.position.z}</td>
+                  <td>${item.item.fragile ? '<span class="fragile">FRÁGIL</span>' : ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          
+          <div class="loading-instructions">
+            <h4>Ordem de Carregamento:</h4>
+            <ol>
+              ${itemsInTrip.map((item, i) => `
+                <li>${item.item.description} ${item.item.fragile ? '(FRÁGIL - cuidado!)' : ''}</li>
+              `).join('')}
+            </ol>
+          </div>
+        </div>
+      `;
+    });
+    
+    html += `
+        <div class="footer">
+          <p>Gerado automaticamente pelo RetLister</p>
+        </div>
+      </body>
+      </html>
+    `;
+    
+    return html;
+  }
+
+function handleExportLoadingOrder() {
+    const van = vans.find(v => v.id === selectedVanId);
+    if (!van || multiTripPlans.length === 0) {
+      alert('Sem plano para imprimir. Gere um plano primeiro.');
+      return;
+    }
+    
+    // 1. Human Readable Helper
+    const getHumanLocation = (item, vanLength, vanWidth) => {
+      const { x, y, z } = item.position;
+      const { placed_width } = item;
+      
+      let parts = [];
+      // Height
+      if (y === 0) parts.push("No Chão");
+      else if (y > 0 && y < 1000) parts.push("Nível Médio");
+      else parts.push("Topo");
+      // Depth
+      if (x === 0) parts.push("Fundo");
+      else if (x < vanLength / 2) parts.push("Meio");
+      else parts.push("Porta");
+      // Side
+      if (z === 0) parts.push("Esq");
+      else if (z + placed_width >= vanWidth) parts.push("Dir");
+      else parts.push("Centro");
+
+      return parts.join(" - ");
+    };
+
+    // 2. Build HTML
+    const tripsHtml = multiTripPlans.map((trip) => {
+      // Sort: Floor up (Y), Back to Front (X)
+      const sortedItems = [...trip.plan.items].sort((a, b) => {
+        if (a.position.x !== b.position.x) return a.position.x - b.position.x;
+        return a.position.y - b.position.y;
+      });
+
+      return `
+        <div class="trip-block">
+          <div class="trip-header">
+            <h2>Viagem ${trip.tripNumber}</h2>
+            <div class="trip-stats">
+              <span>Itens: <strong>${trip.plan.items.length}</strong></span>
+              <span>Peso: <strong>${trip.plan.total_weight.toFixed(1)} kg</strong></span>
+              <span>Ocupação: <strong>${trip.plan.utilization_percent.toFixed(1)}%</strong></span>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width:5%">#</th>
+                <th style="width:40%">Item</th>
+                <th style="width:20%">Dimensões</th>
+                <th style="width:25%">Posição</th>
+                <th style="width:10%">Notas</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sortedItems.map((item, idx) => `
+                <tr>
+                  <td>${idx + 1}</td>
+                  <td>${item.item.description}</td>
+                  <td>${item.placed_length}x${item.placed_width}x${item.placed_height}</td>
+                  <td>${getHumanLocation(item, van.length_mm, van.width_mm)}</td>
+                  <td class="${item.item.fragile ? 'fragile' : ''}">${item.item.fragile ? 'FRÁGIL' : ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="page-break"></div>
+      `;
+    }).join('');
+
+    const unplacedHtml = unplacedItems.length > 0 ? `
+      <div class="unplaced-block">
+        <h3 style="color: #d32f2f;">⚠ Itens Não Carregados (${unplacedItems.length})</h3>
+        <ul>
+          ${unplacedItems.map(i => `<li>${i.description} (${i.length_mm}x${i.width_mm}x${i.height_mm})</li>`).join('')}
+        </ul>
+      </div>
+    ` : '';
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Ordem de Carregamento</title>
+        <style>
+          body { font-family: sans-serif; padding: 20px; }
+          .trip-header { background: #eee; padding: 10px; border-left: 5px solid #333; margin-bottom: 10px; }
+          .trip-stats { display: flex; gap: 15px; font-size: 0.9em; margin-top: 5px; }
+          table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; }
+          th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+          th { background: #f9f9f9; }
+          .fragile { color: red; font-weight: bold; }
+          .page-break { page-break-after: always; }
+          .unplaced-block { border: 1px solid red; padding: 10px; background: #fff5f5; }
+        </style>
+      </head>
+      <body>
+        <h1>Plano de Carregamento - ${van.name}</h1>
+        ${tripsHtml}
+        ${unplacedHtml}
+      </body>
+      </html>
+    `;
+
+    // 3. Print via Iframe
+    const printFrame = document.createElement('iframe');
+    printFrame.style.position = 'fixed';
+    printFrame.style.right = '0';
+    printFrame.style.bottom = '0';
+    printFrame.style.width = '0';
+    printFrame.style.height = '0';
+    printFrame.style.border = '0';
+    document.body.appendChild(printFrame);
+    
+    const frameDoc = printFrame.contentWindow.document;
+    frameDoc.open();
+    frameDoc.write(htmlContent);
+    frameDoc.close();
+    
+    printFrame.onload = () => {
+      try {
+        printFrame.contentWindow.focus();
+        printFrame.contentWindow.print();
+      } catch (e) {
+        console.error(e);
+        alert('Erro ao imprimir via iframe.');
+      }
+      setTimeout(() => document.body.removeChild(printFrame), 2000);
+    };
   }
 
   useEffect(() => { refresh(); }, []);
@@ -935,7 +1458,7 @@ async function fetchEstado() {
                         </div>
                         <div style={{display: 'flex', gap: '5px'}}>
                           <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleEditVan(van); }} title="Editar">✎</button>
-                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleDeleteVan(van.id); }} title="Desativar">🗑</button>
+                          <button className="btn-icon" onClick={(e) => { e.stopPropagation(); handleDeleteVan(van.id); }} title="Desativar">X</button>
                         </div>
                       </div>
                     </div>
@@ -946,9 +1469,121 @@ async function fetchEstado() {
 
             {/* Cargo Items */}
             <div className="panel" style={{flex: 1, display: 'flex', flexDirection: 'column'}}>
-              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px'}}>
+              <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '5px'}}>
                 <h3>Itens a Carregar</h3>
-                <button className="btn btn-primary" disabled={!selectedVanId} onClick={handleAddCargo}>+ Adicionar Item</button>
+                <div style={{display: 'flex', gap: '5px', flexWrap: 'wrap'}}>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+                    const testCabinets = [
+                      { description: 'Armário Grande', length_mm: 800, width_mm: 600, height_mm: 2000, fragile: false, stackable: true, rotation_allowed: true, color: '#8B4513' },
+                      { description: 'Cómoda', length_mm: 1000, width_mm: 500, height_mm: 800, fragile: false, stackable: true, rotation_allowed: true, color: '#DEB887' },
+                      { description: 'Mesa de Cabeceira', length_mm: 450, width_mm: 400, height_mm: 550, fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E' },
+                      { description: 'Mesa de Cabeceira 2', length_mm: 450, width_mm: 400, height_mm: 550, fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E' },
+                      { description: 'Estante Vidro', length_mm: 900, width_mm: 350, height_mm: 1800, fragile: false, stackable: true, rotation_allowed: true, color: '#87CEEB' },
+                      { description: 'Aparador', length_mm: 1200, width_mm: 400, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#A0522D' },
+                      { description: 'Caixa 1', length_mm: 500, width_mm: 400, height_mm: 400, fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F' },
+                      { description: 'Caixa 2', length_mm: 500, width_mm: 400, height_mm: 400, fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F' },
+                      { description: 'Caixa Frágil', length_mm: 400, width_mm: 400, height_mm: 350, fragile: true, stackable: false, rotation_allowed: true, color: '#FF6347' },
+                    ];
+                    setCargoItems(testCabinets);
+                  }}>Teste</button>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+  const fullLoad = [
+  // --- BIG FURNITURE (The Anchors) ---
+  { description: 'Sofá 3 Lugares', length_mm: 2100, width_mm: 900, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#5D4037' },
+  { description: 'Colchão Casal', length_mm: 1900, width_mm: 1400, height_mm: 250, fragile: false, stackable: true, rotation_allowed: true, color: '#F5F5F5' },
+  { description: 'Estrutura Cama', length_mm: 2000, width_mm: 300, height_mm: 200, fragile: false, stackable: true, rotation_allowed: true, color: '#8D6E63' },
+  
+  // --- TALL ITEMS (Must Lay Down) ---
+  { description: 'Roupeiro PAX 1', length_mm: 1000, width_mm: 600, height_mm: 2360, fragile: false, stackable: true, rotation_allowed: true, color: '#FFFFFF' },
+  { description: 'Roupeiro PAX 2', length_mm: 1000, width_mm: 600, height_mm: 2360, fragile: false, stackable: true, rotation_allowed: true, color: '#FFFFFF' },
+  { description: 'Frigorífico Combinado', length_mm: 600, width_mm: 650, height_mm: 1850, fragile: false, stackable: true, rotation_allowed: true, color: '#B0BEC5' },
+
+  // --- APPLIANCES & HEAVY ---
+  { description: 'Máquina Lavar', length_mm: 600, width_mm: 600, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#ECEFF1' },
+  { description: 'Máquina Secar', length_mm: 600, width_mm: 600, height_mm: 850, fragile: false, stackable: true, rotation_allowed: true, color: '#ECEFF1' },
+
+  // --- MEDIUM FURNITURE ---
+  { description: 'Cómoda Malm', length_mm: 800, width_mm: 480, height_mm: 780, fragile: false, stackable: true, rotation_allowed: true, color: '#8B4513' },
+  { description: 'Secretária', length_mm: 1200, width_mm: 600, height_mm: 750, fragile: false, stackable: true, rotation_allowed: true, color: '#A1887F' },
+  { description: 'Estante Billy', length_mm: 800, width_mm: 280, height_mm: 1060, fragile: false, stackable: true, rotation_allowed: true, color: '#5D4037' },
+
+  // --- CHAIRS ---
+  { description: 'Cadeira Jantar 1', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 2', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 3', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+  { description: 'Cadeira Jantar 4', length_mm: 450, width_mm: 450, height_mm: 900, fragile: false, stackable: true, rotation_allowed: true, color: '#DAA520' },
+
+  // --- LARGE BOXES ---
+  ...Array.from({ length: 15 }).map((_, i) => ({
+    description: `Caixa Grande ${i + 1}`,
+    length_mm: 600, width_mm: 400, height_mm: 400,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#CD853F'
+  })),
+
+  // --- MEDIUM BOXES ---
+  ...Array.from({ length: 10 }).map((_, i) => ({
+    description: `Caixa Média ${i + 1}`,
+    length_mm: 500, width_mm: 300, height_mm: 300,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#D2691E'
+  })),
+
+  // --- "FRAGILE" BOXES (now non-fragile & stackable) ---
+  ...Array.from({ length: 5 }).map((_, i) => ({
+    description: `Frágil ${i + 1}`,
+    length_mm: 400, width_mm: 300, height_mm: 300,
+    fragile: false, stackable: true, rotation_allowed: true, color: '#FF6347'
+  }))
+];
+
+  setCargoItems(fullLoad);
+}}>Teste Carga Completa</button>
+                  <button className="btn" disabled={!selectedVanId} onClick={() => {
+                    // Large test - multiple trips needed
+                    // Items are sized to fit in typical vans when laid down
+                    const largeTest = [];
+                    const colors = ['#8B4513', '#DEB887', '#D2691E', '#A0522D', '#CD853F', '#BC8F8F', '#F4A460', '#DAA520'];
+                    for (let i = 1; i <= 15; i++) {
+                      // Wardrobes: max dimension ~1800mm so they fit when laid down
+                      // Height 1600-1800mm, when laid down fits in van length
+                      largeTest.push({ 
+                        description: `Armário ${i}`, 
+                        length_mm: 600 + Math.floor(Math.random() * 300), // 600-900mm
+                        width_mm: 450 + Math.floor(Math.random() * 150), // 450-600mm
+                        height_mm: 1600 + Math.floor(Math.random() * 200), // 1600-1800mm
+                        fragile: false, 
+                        stackable: true, 
+                        rotation_allowed: true, 
+                        color: colors[i % colors.length] 
+                      });
+                    }
+                    for (let i = 1; i <= 10; i++) {
+                      largeTest.push({ 
+                        description: `Cómoda ${i}`, 
+                        length_mm: 800 + Math.floor(Math.random() * 300), 
+                        width_mm: 400 + Math.floor(Math.random() * 200), 
+                        height_mm: 700 + Math.floor(Math.random() * 200), 
+                        fragile: false, 
+                        stackable: true, 
+                        rotation_allowed: true, 
+                        color: colors[(i + 3) % colors.length] 
+                      });
+                    }
+                    for (let i = 1; i <= 20; i++) {
+                      largeTest.push({ 
+                        description: `Caixa ${i}`, 
+                        length_mm: 400 + Math.floor(Math.random() * 200), 
+                        width_mm: 300 + Math.floor(Math.random() * 200), 
+                        height_mm: 300 + Math.floor(Math.random() * 200), 
+                        fragile: i <= 3,
+                        stackable: i > 3, // Fragile boxes can't be stacked on
+                        rotation_allowed: true, 
+                        color: i <= 3 ? '#FF6347' : '#CD853F' 
+                      });
+                    }
+                    setCargoItems(largeTest);
+                  }} title="45 itens - necessita múltiplas viagens">Teste Grande</button>
+                  <button className="btn btn-primary" disabled={!selectedVanId} onClick={handleAddCargo}>+ Adicionar</button>
+                </div>
               </div>
               {cargoItems.length === 0 ? (
                 <div className="empty-state" style={{padding: '20px', textAlign: 'center', color: '#666'}}>
@@ -965,8 +1600,7 @@ async function fetchEstado() {
                           <strong>{item.description || `Item ${idx + 1}`}</strong>
                           <div className="small muted">
                             {item.length_mm}×{item.width_mm}×{item.height_mm} mm
-                            {item.weight_kg && ` | ${item.weight_kg}kg`}
-                            {item.fragile && ' | 🔴 Frágil'}
+                            {item.fragile && ' | Frágil'}
                           </div>
                         </div>
                         <div style={{display: 'flex', gap: '5px'}}>
@@ -979,14 +1613,23 @@ async function fetchEstado() {
                 </div>
               )}
               {cargoItems.length > 0 && selectedVanId && (
-                <button 
-                  className="btn btn-success" 
-                  style={{marginTop: '10px'}} 
-                  onClick={handleGeneratePlan}
-                  disabled={isOptimizing}
-                >
-                  {isOptimizing ? 'A processar...' : 'Gerar Plano de Carregamento'}
-                </button>
+                <div style={{marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '5px'}}>
+                  <button 
+                    className="btn btn-success" 
+                    onClick={handleGeneratePlan}
+                    disabled={isOptimizing}
+                  >
+                    {isOptimizing ? 'A processar...' : 'Gerar Plano de Carregamento'}
+                  </button>
+                  <button 
+                    className="btn" 
+                    onClick={handleGenerateMultiTripPlan}
+                    disabled={isOptimizing}
+                    title="Divide automaticamente os itens em múltiplas viagens se não couberem numa só"
+                  >
+                    {isOptimizing ? 'A processar...' : 'Plano Multi-Viagem'}
+                  </button>
+                </div>
               )}
               
               {/* Warnings display */}
@@ -1025,12 +1668,95 @@ async function fetchEstado() {
             ) : (
               <div style={{display: 'flex', flexDirection: 'column', height: '100%'}}>
                 <div style={{padding: '20px', borderBottom: '1px solid #ddd'}}>
-                  <div className="panel-header" style={{marginBottom: '15px'}}>
+                  <div className="panel-header" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px'}}>
                     <h3>Plano de Carregamento</h3>
+                    <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+                      {/* Trip navigation for multi-trip plans */}
+                      {multiTripPlans.length > 1 && (
+                        <div style={{display: 'flex', alignItems: 'center', gap: '5px', background: '#e3f2fd', padding: '5px 10px', borderRadius: '4px'}}>
+                          <button 
+                            className="btn-icon" 
+                            onClick={() => {
+                              const newIdx = Math.max(0, currentTripIndex - 1);
+                              setCurrentTripIndex(newIdx);
+                              setLoadingPlan(multiTripPlans[newIdx].plan);
+                            }}
+                            disabled={currentTripIndex === 0}
+                          >
+                            ◀
+                          </button>
+                          <span style={{fontWeight: 'bold', minWidth: '100px', textAlign: 'center'}}>
+                            Viagem {currentTripIndex + 1} / {multiTripPlans.length}
+                          </span>
+                          <button 
+                            className="btn-icon" 
+                            onClick={() => {
+                              const newIdx = Math.min(multiTripPlans.length - 1, currentTripIndex + 1);
+                              setCurrentTripIndex(newIdx);
+                              setLoadingPlan(multiTripPlans[newIdx].plan);
+                            }}
+                            disabled={currentTripIndex === multiTripPlans.length - 1}
+                          >
+                            ▶
+                          </button>
+                        </div>
+                      )}
+                      <button 
+                        className="btn" 
+                        onClick={handleExportLoadingOrder}
+                        title="Imprimir ordem de carregamento"
+                      >
+                        🖨 Imprimir
+                      </button>
+                      <button 
+                        className="btn" 
+                        onClick={() => {
+                          setLoadingPlan(null);
+                          setMultiTripPlans([]);
+                          setCurrentTripIndex(0);
+                          setUnplacedItems([]);
+                        }}
+                      >
+                        Limpar
+                      </button>
+                    </div>
                   </div>
                   
+                  {/* Multi-trip summary */}
+                  {multiTripPlans.length > 1 && (
+                    <div style={{marginBottom: '15px', padding: '10px', background: '#e8f5e9', borderRadius: '4px', border: '1px solid #4caf50'}}>
+                      <strong style={{color: '#2e7d32'}}>Plano Multi-Viagem:</strong>
+                      <span style={{marginLeft: '10px'}}>
+                        {multiTripPlans.length} viagens necessárias para {cargoItems.length} itens
+                      </span>
+                      {unplacedItems.length > 0 && (
+                        <div style={{marginTop: '15px', padding: '15px', background: '#ffebee', border: '1px solid #ef5350', borderRadius: '4px'}}>
+                      <h4 style={{margin: '0 0 10px 0', color: '#c62828', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                        ⚠ {unplacedItems.length} Itens Não Carregados
+                      </h4>
+                      <p style={{fontSize: '13px', margin: '0 0 10px 0', color: '#333'}}>
+                        Estes itens não cabem na carrinha e ficaram para trás:
+                      </p>
+                      <ul style={{margin: 0, paddingLeft: '20px', color: '#b71c1c', maxHeight: '100px', overflowY: 'auto'}}>
+                        {unplacedItems.map((item, idx) => (
+                          <li key={idx} style={{fontSize: '13px'}}>
+                            <strong>{item.description}</strong> ({item.length_mm}x{item.width_mm}x{item.height_mm})
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                      )}
+                    </div>
+                  )}
+                  
                   {/* Stats */}
-                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px'}}>
+                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '10px'}}>
+                    {multiTripPlans.length > 1 && (
+                      <div className="stat-box" style={{padding: '10px', background: '#e3f2fd', border: '1px solid #1976d2', borderRadius: '4px'}}>
+                        <div className="small muted">Viagem</div>
+                        <div style={{fontSize: '20px', fontWeight: 'bold', color: '#1976d2'}}>{currentTripIndex + 1} / {multiTripPlans.length}</div>
+                      </div>
+                    )}
                     <div className="stat-box" style={{padding: '10px', background: 'white', border: '1px solid #ddd', borderRadius: '4px'}}>
                       <div className="small muted">Items</div>
                       <div style={{fontSize: '20px', fontWeight: 'bold'}}>{loadingPlan.items.length}</div>
@@ -1490,15 +2216,16 @@ async function fetchEstado() {
             <form onSubmit={(e) => {
               e.preventDefault();
               const formData = new FormData(e.target);
+              const isFragile = formData.get('fragile') === 'on';
               handleSaveCargo({
                 description: formData.get('description'),
                 length_mm: Number(formData.get('length_mm')),
                 width_mm: Number(formData.get('width_mm')),
                 height_mm: Number(formData.get('height_mm')),
-                weight_kg: Number(formData.get('weight_kg')) || 1,
-                fragile: formData.get('fragile') === 'on',
+                weight_kg: 1, // Weight not used but kept for API compatibility
+                fragile: isFragile,
                 rotation_allowed: formData.get('rotation_allowed') === 'on',
-                stackable: formData.get('stackable') === 'on',
+                stackable: !isFragile, // Fragile items cannot be stacked on
                 color: formData.get('color') || '#74c0fc'
               });
             }}>
@@ -1551,19 +2278,6 @@ async function fetchEstado() {
                   />
                 </label>
                 <label>
-                  Peso (kg):
-                  <input 
-                    type="number" 
-                    name="weight_kg" 
-                    defaultValue={editingCargo?.weight_kg || ''} 
-                    required
-                    min="0.1" 
-                    max="500" 
-                    step="0.1" 
-                    placeholder="80" 
-                  />
-                </label>
-                <label>
                   Cor (visualização):
                   <input 
                     type="color" 
@@ -1580,7 +2294,7 @@ async function fetchEstado() {
                     defaultChecked={editingCargo?.fragile || false}
                     style={{accentColor: '#d32f2f', margin: 0, flexShrink: 0}}
                   />
-                  <span style={{whiteSpace: 'nowrap'}}>Frágil</span>
+                  <span style={{whiteSpace: 'nowrap'}}>Frágil (não pode ter itens em cima)</span>
                 </label>
                 <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
                   <input 
@@ -1590,15 +2304,6 @@ async function fetchEstado() {
                     style={{accentColor: '#1976d2', margin: 0, flexShrink: 0}}
                   />
                   <span style={{whiteSpace: 'nowrap'}}>Permitir rotação</span>
-                </label>
-                <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
-                  <input 
-                    type="checkbox" 
-                    name="stackable" 
-                    defaultChecked={editingCargo?.stackable !== false}
-                    style={{accentColor: '#388e3c', margin: 0, flexShrink: 0}}
-                  />
-                  <span style={{whiteSpace: 'nowrap'}}>Empilhável</span>
                 </label>
               </div>
               <div className="modal-actions" style={{marginTop: '12px'}}>

@@ -99,7 +99,7 @@ curl http://localhost:8000/health
 3. **Create `config.json` on Secretary PC:**
    ```json
    {
-     "main_server_url": "http://192.168.1.10:8000"
+     "main_server_url": "https://api.faky.dev"
    }
    ```
 

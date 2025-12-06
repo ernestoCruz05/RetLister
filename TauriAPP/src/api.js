@@ -1,4 +1,7 @@
-let SERVER_URL = localStorage.getItem("retlister_server_url") || "http://localhost:8000";
+import { invoke } from "@tauri-apps/api/core";
+
+let SERVER_URL =
+  localStorage.getItem("retlister_server_url") || "https://api.faky.dev";
 
 export function setServerUrl(url) {
   SERVER_URL = url.replace(/\/$/, "");
@@ -9,133 +12,101 @@ export function getServerUrl() {
   return SERVER_URL;
 }
 
+async function apiCall(method, endpoint, body = null) {
+  const url = `${SERVER_URL}${endpoint}`;
+
+  try {
+    const responseString = await invoke("authenticated_request", {
+      method,
+      url,
+      body,
+    });
+    return JSON.parse(responseString);
+  } catch (error) {
+    console.error(`API Error (${endpoint}):`, error);
+    throw error;
+  }
+}
+
 export async function listRestos() {
-  const res = await fetch(`${SERVER_URL}/list`);
-  if (!res.ok) throw new Error(`List failed: ${res.status}`);
-  return res.json();
+  return apiCall("GET", "/list");
 }
 
 export async function addResto(payload) {
-  const res = await fetch(`${SERVER_URL}/add`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(`Add failed: ${res.status}`);
-  return res.json();
+  return apiCall("POST", "/add", JSON.stringify(payload));
 }
 
 export async function removeResto(id) {
-  const res = await fetch(`${SERVER_URL}/remove/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error(`Remove failed: ${res.status}`);
+  return apiCall("DELETE", `/remove/${id}`);
 }
 
 export async function searchResto(params) {
   const q = new URLSearchParams(params).toString();
-  const res = await fetch(`${SERVER_URL}/search?${q}`);
-  if (!res.ok) throw new Error(`Search failed: ${res.status}`);
-  return res.json();
+  return apiCall("GET", `/search?${q}`);
 }
 
 export async function updateResto(id, payload) {
-  const res = await fetch(`${SERVER_URL}/update/${id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(`Update failed: ${res.status}`);
+  return apiCall("POST", `/update/${id}`, JSON.stringify(payload));
 }
 
 export async function getStats() {
-  const res = await fetch(`${SERVER_URL}/stats`);
-  if (!res.ok) throw new Error(`Stats failed: ${res.status}`);
-  return res.json();
+  return apiCall("GET", "/stats");
 }
 
 // ===== VAN API =====
 
 export async function listVans() {
-  const res = await fetch(`${SERVER_URL}/vans`);
-  if (!res.ok) throw new Error(`List vans failed: ${res.status}`);
-  return res.json();
+  return apiCall("GET", "/vans");
 }
 
 export async function getVan(id) {
-  const res = await fetch(`${SERVER_URL}/vans/${id}`);
-  if (!res.ok) throw new Error(`Get van failed: ${res.status}`);
-  return res.json();
+  return apiCall("GET", `/vans/${id}`);
 }
 
 export async function addVan(payload) {
-  console.log('Adding van with payload:', payload);
-  const res = await fetch(`${SERVER_URL}/vans`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const error = await res.json();
-    console.error('Add van error:', error);
-    throw new Error(error.error || `Add van failed: ${res.status}`);
-  }
-  return res.json();
+  console.log("Adding van with payload:", payload);
+  return apiCall("POST", "/vans", JSON.stringify(payload));
 }
 
 export async function updateVan(id, payload) {
-  const res = await fetch(`${SERVER_URL}/vans/${id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const error = await res.json();
-    throw new Error(error.error || `Update van failed: ${res.status}`);
-  }
+  return apiCall("POST", `/vans/${id}`, JSON.stringify(payload));
 }
 
 export async function deleteVan(id) {
-  const res = await fetch(`${SERVER_URL}/vans/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error(`Delete van failed: ${res.status}`);
+  return apiCall("DELETE", `/vans/${id}`);
 }
 
 // ===== OPTIMIZE API =====
 
 export async function optimizeLoading(van_id, items) {
-  const res = await fetch(`${SERVER_URL}/optimize`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ van_id, items }),
-  });
-  if (!res.ok) {
-    const error = await res.json();
-    throw new Error(error.error || `Optimize failed: ${res.status}`);
-  }
-  return res.json();
+  return apiCall("POST", "/optimize", JSON.stringify({ van_id, items }));
 }
 
-export async function optimizeCuts(cuts, kerf_width_mm = 3, min_remainder_width_mm = 100, min_remainder_height_mm = 100) {
-  console.log('API Call - optimizeCuts with:', { cuts, kerf_width_mm, min_remainder_width_mm, min_remainder_height_mm });
-  
-  const res = await fetch(`${SERVER_URL}/optimize_cuts`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ 
-      cuts, 
-      kerf_width_mm, 
-      min_remainder_width_mm, 
-      min_remainder_height_mm 
-    }),
+export async function optimizeCuts(
+  cuts,
+  kerf_width_mm = 3,
+  min_remainder_width_mm = 100,
+  min_remainder_height_mm = 100
+) {
+  console.log("API Call - optimizeCuts with:", {
+    cuts,
+    kerf_width_mm,
+    min_remainder_width_mm,
+    min_remainder_height_mm,
   });
-  
-  console.log('API Response status:', res.status);
-  
-  if (!res.ok) {
-    const error = await res.json();
-    console.error('API Error:', error);
-    throw new Error(error.error || `Optimize cuts failed: ${res.status}`);
-  }
-  
-  const data = await res.json();
-  console.log('API Response data:', data);
-  return data;
+
+  const payload = {
+    cuts,
+    kerf_width_mm,
+    min_remainder_width_mm,
+    min_remainder_height_mm,
+  };
+
+  const result = await apiCall(
+    "POST",
+    "/optimize_cuts",
+    JSON.stringify(payload)
+  );
+  console.log("API Response data:", result);
+  return result;
 }

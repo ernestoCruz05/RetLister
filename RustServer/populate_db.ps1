@@ -1,56 +1,55 @@
 # Script to populate the database with diverse leftover pieces (retalhos)
 
-$SERVER_URL = "https://api.faky.dev"
+$SERVER_URL = "http://localhost:8000"
 
 # Common materials used in workshops
-$materials = @("MDF", "Contraplacado", "Aglomerado", "OSB", "Melamina", "Madeira Maciça", "Forro", "HDF")
+$material = "MDF"
+$thickness = 18
 
-# Common thicknesses in mm
-$thicknesses = @(3, 6, 9, 12, 15, 18, 19, 22, 25, 30)
-
-# Sample notes
+# Sample notes for context
 $notes_samples = @(
-    "Bom estado",
-    "Pequeno risco no canto",
-    "Superficie limpa",
-    "Resto de corte diagonal",
-    "Bordos irregulares",
-    "",
-    "Pronto a usar",
-    "Verificar medidas",
-    "Peça de qualidade",
-    "Sobra de projeto anterior"
+    "Frente de gaveta",
+    "Lateral armário",
+    "Prateleira",
+    "Tampo de mesa",
+    "Rodapé",
+    "Painel traseiro",
+    "Porta pequena",
+    "Reforço estrutural"
 )
 
-Write-Host "Populating database with diverse retalhos..." -ForegroundColor Green
+Write-Host "Populating database with 18mm MDF pieces for Nesting Test..." -ForegroundColor Cyan
 
-# Generate 50 diverse leftover pieces
+# Generate 50 random pieces
 for ($i = 1; $i -le 50; $i++) {
-    # Random dimensions (realistic workshop leftovers)
-    $width = Get-Random -Minimum 100 -Maximum 2400
-    $height = Get-Random -Minimum 80 -Maximum 1800
-    $thickness = $thicknesses | Get-Random
-    $material = $materials | Get-Random
-    $notes = $notes_samples | Get-Random
+    # Random dimensions (realistic furniture parts)
+    # Width: 100mm to 1200mm
+    # Height: 100mm to 2000mm
+    $width = Get-Random -Minimum 100 -Maximum 1200
+    $height = Get-Random -Minimum 100 -Maximum 2000
+    
+    # Pick a random note
+    $note_idx = Get-Random -Minimum 0 -Maximum $notes_samples.Count
+    $notes = $notes_samples[$note_idx]
 
     $body = @{
         width_mm = $width
         height_mm = $height
         thickness_mm = $thickness
         material = $material
-        notes = if ($notes -eq "") { $null } else { $notes }
+        notes = "$notes (Test Item $i)"
     } | ConvertTo-Json
 
     try {
         $response = Invoke-RestMethod -Uri "$SERVER_URL/add" -Method Post -ContentType "application/json" -Body $body
-        Write-Host "[$i/50] Added: ${width}x${height}x${thickness}mm $material (ID: $($response.id))" -ForegroundColor Cyan
+        Write-Host "[$i/50] Added: ${width}x${height}x${thickness}mm $material - ID: $($response.id)" -ForegroundColor Green
     } catch {
-        Write-Host "[$i/50] Failed to add resto: $_" -ForegroundColor Red
+        Write-Host "[$i/50] Failed to add item: $_" -ForegroundColor Red
     }
 
-    # Small delay to avoid overwhelming the server
-    Start-Sleep -Milliseconds 50
+    # Tiny delay to be nice to the local server
+    Start-Sleep -Milliseconds 20
 }
 
-Write-Host "`nDone! Added 50 diverse retalhos to the database." -ForegroundColor Green
-Write-Host "Run 'Invoke-RestMethod -Uri $SERVER_URL/stats' to see statistics." -ForegroundColor Yellow
+Write-Host "`nDone! Added 50 pieces of 18mm MDF." -ForegroundColor Yellow
+Write-Host "Now go to the 'Otimizador' tab in the app and try to cut a list of MDF 18mm parts." -ForegroundColor White

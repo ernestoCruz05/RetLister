@@ -190,7 +190,7 @@ async fn auth_middleware(
 
 // ===== DATA MODELS =====
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone)]
 struct Leftover {
     id: i64,
     width_mm: i64,
@@ -513,10 +513,13 @@ async fn remove_resto(
         .execute(&state.db)
         .await
         .map_err(AppError::Database)?;
+
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("No resto with id {}", id)));
     }
-    Ok(StatusCode::NO_CONTENT)
+
+    tracing::info!(id = id, "Removed resto");
+    Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
 #[derive(Deserialize)]
@@ -681,7 +684,7 @@ async fn update_van(
         .bind(&req.notes).bind(req.active).bind(id)
         .execute(&state.db).await.map_err(AppError::Database)?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn delete_van(
@@ -697,7 +700,7 @@ async fn delete_van(
     if rows == 0 {
         return Err(AppError::NotFound(format!("Van {} not found", id)));
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
 // ===== OPTIMIZATION (OFFLOADED TO PYTHON) =====

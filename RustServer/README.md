@@ -1,44 +1,56 @@
 ﻿# RetLister Server
 
-Rust/Axum REST API for managing leftover wood pieces with SQLite backend.
+The central backend for the RetLister ecosystem. It is a high-performance REST API written in Rust using Axum and SQLite.
 
 ## Features
 
-- CRUD operations for wood remnants
-- Search by dimensions, thickness, and material (case-insensitive)
-- Statistics aggregation by material and thickness
-- Partial update support
-- SQLite with WAL mode for concurrent access
-- RFC3339 timestamps
+* **Core API:** CRUD operations for inventory management.
+* **Optimization Engine:** Spawns a Python sidecar process to calculate 3D loading plans and 2D cutting optimizations.
+* **Concurrency:** SQLite configured in WAL mode to handle concurrent requests from the Proxy and Tauri clients.
+* **Robust Logging:** Tracing subscriber integration for request debugging.
 
-## Endpoints
+## Requirements
 
-### Resto Operations
-- `POST /add` - Add new leftover piece
-- `DELETE /remove/:id` - Remove piece by ID
-- `POST /update/:id` - Partial update of piece attributes
-- `GET /list` - List all pieces (newest first)
-- `POST /search` - Find suitable leftovers for given dimensions
+* **Rust:** Stable toolchain (1.70+).
+* **Python:** 3.10+ (Required for `optimizer.py`).
+    * Ensure `python3` or `py` (Windows) is in your PATH.
 
-### Statistics
-- `GET /stats` - Aggregate statistics by material and thickness
+## Configuration
+
+The server runs on `0.0.0.0:8000` by default.
+Database file is created automatically at `data/retlister.db`.
 
 ## Running
 
-```powershell
-cd RustServer
-cargo run --release
-```
+1.  Install dependencies and build:
+    ```powershell
+    cargo build --release
+    ```
 
-Server listens on `http://localhost:8000`.
+2.  Run the server:
+    ```powershell
+    cargo run --release
+    ```
 
-## Database
+3.  (Optional) Populate with dummy data:
+    ```powershell
+    .\populate_db.ps1
+    ```
 
-Location: `data/retlister.db`
-Migrations: `Migrations/0001_leftovers.sql`
+## API Endpoints
 
-## Sample Data
+### Inventory
+* `GET /list` - Retrieve all items.
+* `POST /add` - Create a new item.
+* `POST /update/:id` - Edit item details.
+* `DELETE /remove/:id` - Delete a specific item.
+* `POST /delete_batch` - Bulk deletion.
 
-```powershell
-.\populate_db.ps1
-```
+### Logic & Search
+* `GET /search` - Filter by dimensions and material.
+* `POST /optimize` - Calculates 3D van loading plans (delegates to Python).
+* `POST /optimize_cuts` - Calculates 2D cutting layouts.
+
+### System
+* `GET /health` - Liveness probe.
+* `GET /stats` - Aggregated material statistics.

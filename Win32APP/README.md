@@ -1,60 +1,45 @@
-# RetLister Win32 Application
+# RetLister Win32 Client
 
-Native Windows XP/2000 client for managing wood leftovers through ProxyService.
+A native Windows application written in C (Win32 API) designed for legacy hardware (Windows 98/2000/XP). It eliminates the need for heavy runtimes like .NET or Java, ensuring smooth performance on constrained hardware.
+
+It communicates exclusively with the **ProxyService** (running on a modern host) to bridge the gap between legacy network stacks and the modern REST API.
+
+## Architecture
+
+* **Language:** C (C99 standard compatible)
+* **GUI:** Pure Win32 API (User32, GDI32, Comctl32)
+* **Network:** WinInet (Internet Explorer network stack)
+* **Rendering:** Custom GDI routines for visualizing cutting plans without OpenGL/DirectX.
 
 ## Features
 
-- List all wood pieces from inventory
-- Remove selected items
-- Windows Classic UI (compatible with XP)
-- Connects to ProxyService on Windows 11 host
+* **Inventory Management:**
+  * **Retalhos:** Tabular view of all wood remnants with sortable columns.
+  * **Search:** Filter inventory by dimensions and material.
+* **Cutting Optimization:**
+  * **Visualizer:** Renders 2D cutting layouts directly on the GDI canvas.
+  * **Workflow:** Supports adding cut requests, running the optimizer (via Proxy), and confirming stock deduction.
+* **System Status:**
+  * Real-time monitoring of Proxy and Main Server connectivity.
+  * Offline detection.
 
-## Building
+## Configuration Files
 
-### Visual Studio Command Prompt
+The application looks for configuration files in the executable's directory. These are created automatically if they do not exist.
 
-```batch
-build.bat
-```
+* **`proxy.cfg`**: Contains the URL of the Proxy Service.
+  * Default: `http://192.168.56.1:8001`
+  * Format: Plain text URL (e.g., `http://192.168.1.10:8001`)
+* **`ui.cfg`**: Stores persistent UI preferences.
+  * Font size settings.
+  * Column widths for the inventory list.
 
-### Manual Compilation
+## Build Instructions
 
-```batch
-cl.exe /EHsc /O2 RetLister.cpp /Fe:RetLister.exe /link user32.lib gdi32.lib comctl32.lib wininet.lib shlwapi.lib
-```
+The source code `RetLister.c` is single-file and compiler-agnostic.
 
-### MinGW
+### Visual Studio (MSVC)
+I could not get this too work, it should be possible but i find the pelles C much easier...
 
-```batch
-g++ -O2 -mwindows RetLister.cpp -o RetLister.exe -lcomctl32 -lwininet -lshlwapi
-```
-
-## Configuration
-
-Edit `RetLister.cpp` and change the PROXY_URL:
-
-```cpp
-#define PROXY_URL "http://192.168.56.1:8001"
-```
-
-Set this to your Windows 11 machine's IP address on the Ethernet network.
-
-## Requirements
-
-- Windows XP SP3 or later
-- Network access to ProxyService
-- Internet Explorer 6+ (for WinINet)
-
-## Current Status
-
-Implemented:
-- List view with all resto data
-- Refresh functionality
-- Delete selected item
-- Status bar with count
-
-Coming soon:
-- Add new resto dialog
-- Search dialog
-- Edit functionality
-- Connection diagnostics
+### Pelles
+A build_pelles.bat script is included for users of Pelles C, a popular environment for maintaining legacy Windows software.

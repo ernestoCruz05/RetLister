@@ -614,8 +614,8 @@ async fn main() {
 
     let db = init_db().await.expect("Failed to initialize database");
 
-    let auth_token =
-        std::env::var("AUTH_TOKEN").unwrap_or_else(|_| "ambrito-carpintaria-123".to_string());
+    let auth_token = std::env::var("RETLISTER_API_TOKEN")
+        .expect("RETLISTER_API_TOKEN environment variable must be set");
 
     let state = Arc::new(AppState {
         db,

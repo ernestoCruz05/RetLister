@@ -1,59 +1,48 @@
-# RetLister Tauri Application
+# RetLister Tauri Client
 
-Windows desktop application for managing wood leftovers with Windows Classic UI styling.
+The modern dashboard for the RetLister system, built as a native Windows 11 desktop application using Tauri. It provides advanced visualization and management capabilities that extend beyond the legacy client's feature set.
+
+## Tech Stack
+
+* **Core:** [Tauri v2](https://tauri.app/) (Rust)
+* **Frontend:** React 19
+* **Build Tool:** Vite
+* **Visualization:** Three.js with `@react-three/fiber` and `@react-three/drei`.
+* **UI/UX:** Custom CSS implementation of the "Windows Classic" aesthetic to maintain visual consistency with the legacy Win32 app.
 
 ## Features
 
-### Restos Management
-- Add, edit, delete wood pieces with dimensions and material info
-- Multi-select with Ctrl+Click for bulk operations
-- Quick filters by material and thickness
-- Resizable columns
-- Double-click to edit
-- Keyboard shortcuts (Del, Enter, Esc)
-- Case-insensitive search with auto-selection
+### Inventory Management
+* **CRUD Operations:** Full creation, reading, updating, and deletion of inventory items.
+* **Bulk Actions:** Multi-select support (Ctrl+Click) for batch deletion or modification.
+* **Advanced Filtering:** Client-side sorting and filtering by material, thickness, and dimensions.
 
-### Statistics Dashboard
-- Total inventory count and area
-- Breakdown by material type
-- Breakdown by thickness
+### 3D & 2D Visualization
+* **Cutting Optimizer:** Interacts with the backend's optimization engine to display 2D cutting layouts for panel saws.
+* **Cargo Loading:** Uses Three.js to render 3D packing of wood remnants into transport vans, helping visualize space utilization.
 
-### Cutting Optimizer
-- Guillotine bin packing algorithm
-- Multi-strategy optimization (area, width, height, perimeter)
-- Configurable saw kerf width
-- Minimum remainder constraints
-- SVG visualization of cutting layouts
-- Confirm/discard workflow
+## Prerequisites
 
-### Settings
-- Kerf width (default: 3mm)
-- Minimum remainder dimensions (default: 300x300mm)
+* **Node.js:** v18 or newer.
+* **Rust:** Stable toolchain (1.70+).
+* **Backend:** The `RustServer` must be running on `http://localhost:8000` for API calls to succeed.
 
-## Design
+## Development
 
-Windows 2000/XP enterprise aesthetic with:
-- Tahoma 12px font
-- 3D beveled controls
-- Folder-style tabs
-- Classic color scheme (#d4d0c8)
+1.  **Install Frontend Dependencies:**
+    ```powershell
+    npm install
+    ```
 
-## Running
+2.  **Run in Development Mode:**
+    This starts the Vite dev server and the Tauri window.
+    ```powershell
+    npm run tauri dev
+    ```
 
-```powershell
-cd TauriAPP
-npm install
-npm run tauri dev
-```
+## Building for Production
 
-## Building
+To create a standalone Windows installer (`.msi`) or executable (`.exe`):
 
 ```powershell
 npm run tauri build
-```
-
-## Requirements
-
-- Node.js 18+
-- Rust 1.70+
-- RetLister server running on `http://localhost:8000`

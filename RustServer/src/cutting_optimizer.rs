@@ -224,18 +224,16 @@ fn run_optimization_sync_asd(
                 let b_used = used_planks.iter().any(|p| p.resto_id == plank_b.id);
 
                 match (a_used, b_used) {
-                    (true, false) => Ordering::Less, // Prioritize already-used planks
+                    (true, false) => Ordering::Less,
                     (false, true) => Ordering::Greater,
                     _ => {
-                        // For unused planks: SMALLEST first to minimize waste
                         let area_a = plank_a.width_mm * plank_a.height_mm;
                         let area_b = plank_b.width_mm * plank_b.height_mm;
-                        area_a.cmp(&area_b) // FIXED: Small planks first
+                        area_a.cmp(&area_b)
                     }
                 }
             });
 
-            // Debug: print sorted planks for this cut
             println!("Cut {}x{} - Sorted planks:", cut.width_mm, cut.height_mm);
             for (i, (plank, _)) in planks.iter().take(5).enumerate() {
                 println!(
@@ -464,16 +462,14 @@ fn find_all_placements(
         }
     }
 
-    // Sort options: prioritize already-used planks, then smallest planks
     options.sort_by(|a, b| {
         let a_used = state.used_planks.iter().any(|p| p.resto_id == a.0);
         let b_used = state.used_planks.iter().any(|p| p.resto_id == b.0);
 
         match (a_used, b_used) {
-            (true, false) => Ordering::Less, // Prefer already-used
+            (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
             _ => {
-                // For same usage status: prefer smaller planks
                 let a_plank = inventory.iter().find(|p| p.id == a.0).unwrap();
                 let b_plank = inventory.iter().find(|p| p.id == b.0).unwrap();
                 let area_a = a_plank.width_mm * a_plank.height_mm;

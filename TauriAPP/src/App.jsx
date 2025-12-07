@@ -3,6 +3,9 @@ import "./App.css";
 import { addResto, listRestos, removeResto, searchResto, updateResto, getStats, listVans, addVan, updateVan, deleteVan, optimizeLoading, optimizeCuts as optimizeCutsAPI, getServerUrl, setServerUrl } from "./api";
 import VanVisualization from "./VanVisualization";
 import { invoke } from "@tauri-apps/api/core";
+import CuttingPlanVisualization from './CuttinPlanVisualization';
+
+
 
 async function optimizeCuts(cuttingList, settings) {
   const { kerfWidth, minRemainderWidth, minRemainderHeight } = settings;
@@ -126,6 +129,13 @@ function App() {
   const [editForm, setEditForm] = useState({ width_mm: "", height_mm: "", thickness_mm: "", material: "", notes: "" });
 
   const tableRef = useRef(null);
+
+  const maxSheetWidth = useMemo(() => {
+    if (!optimizationResult?.usedPlanks) return 0;
+    // Safety check: ensure array is not empty to avoid -Infinity
+    if (optimizationResult.usedPlanks.length === 0) return 0;
+    return Math.max(...optimizationResult.usedPlanks.map(p => p.resto.width_mm));
+  }, [optimizationResult]);
 
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -373,6 +383,16 @@ async function handleGeneratePlan() {
       
       const result = await optimizeLoading(selectedVanId, cargoItems);
       
+      if (!result.success) {
+        setLoadingPlan(null);
+        const errorMsg = result.warnings && result.warnings.length > 0
+          ? result.warnings.join('\n')
+          : 'Erro desconhecido no optimizador.';
+        
+        alert(`Otimização falhou:\n\n${errorMsg}`);
+        return;
+      }
+
       if (result.success && result.plan) {
         setLoadingPlan(result.plan);
         setUnplacedItems(result.unplaced_items || []); // Capture leftovers
@@ -387,8 +407,15 @@ async function handleGeneratePlan() {
       }
     } catch (err) {
       console.error('Optimization failed:', err);
-      let msg = err.message || "Erro desconhecido";
-      alert(`Erro no servidor:\n${msg}`);
+      
+      // Tenta extrair a mensagem de erro real do objeto de erro
+      let msg = "Erro desconhecido";
+      if (typeof err === 'string') msg = err;
+      else if (err.error) msg = `${err.error} \n ${err.details || ''}`;
+      else if (err.message) msg = err.message;
+      else if (err.body) msg = JSON.stringify(err.body);
+      
+      alert(`Erro Crítico no Servidor:\n${msg}`);
     } finally {
       setIsOptimizing(false);
     }
@@ -996,7 +1023,7 @@ function handleExportLoadingOrder() {
       setSearchOpen(false);
       
       if (sorted.length > 0) {
-        setSelectedId(sorted[0].id);
+        setSelectedIds([sorted[0].id]);
         setTimeout(() => {
           const el = document.getElementById(`row-${sorted[0].id}`);
           if (el && tableRef.current) {
@@ -1004,7 +1031,7 @@ function handleExportLoadingOrder() {
           }
         }, 0);
       } else {
-        setSelectedId(null);
+        setSelectedIds([]);
       }
     } catch (e) {
       setError(String(e));
@@ -1307,6 +1334,7 @@ function handleExportLoadingOrder() {
                 ))
               )}
             </div>
+                          
             <button 
               className="btn primary" 
               disabled={cuttingList.length === 0 || loading}
@@ -1382,37 +1410,15 @@ function handleExportLoadingOrder() {
                   </button>
                 </div>
                 <div className="planks-visualization">
-                  {optimizationResult.usedPlanks.map((plank, idx) => (
-                    <div key={idx} className="plank-card">
-                      <div className="plank-header">
-                        <strong>Placa #{plank.resto.id} - {plank.resto.material} {plank.resto.thickness_mm}mm</strong>
-                        <span>{plank.resto.width_mm}x{plank.resto.height_mm}mm</span>
-                      </div>
-                      <svg className="plank-svg" viewBox={`0 0 ${plank.resto.width_mm} ${plank.resto.height_mm}`} preserveAspectRatio="xMidYMid meet">
-                        <rect width={plank.resto.width_mm} height={plank.resto.height_mm} fill="#f0f0f0" stroke="#333" strokeWidth="2"/>
-                        {plank.cuts.map((cut, cidx) => (
-                          <g key={cidx}>
-                            <rect x={cut.x} y={cut.y} width={cut.width_mm} height={cut.height_mm} fill="#4a9eff" stroke="#000" strokeWidth="1" opacity="0.7"/>
-                            <text x={cut.x + cut.width_mm/2} y={cut.y + cut.height_mm/2} textAnchor="middle" fontSize="12" fill="#000">
-                              {cut.width_mm}x{cut.height_mm}
-                            </text>
-                          </g>
-                        ))}
-                      </svg>
-                      <div className="plank-waste">Desperdício: {plank.wastePercent.toFixed(1)}%</div>
-                    </div>
-                  ))}
-                  {optimizationResult.unplacedCuts && optimizationResult.unplacedCuts.length > 0 && (
-                    <div className="alert warning">
-                      <strong>Peças não encaixadas:</strong>
-                      <ul>
-                        {optimizationResult.unplacedCuts.map((cut, idx) => (
-                          <li key={idx}>{cut.width_mm}x{cut.height_mm}x{cut.thickness_mm}mm {cut.material} (x{cut.quantity})</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                </div>
+  {optimizationResult.usedPlanks.map((plank, idx) => (
+    <CuttingPlanVisualization 
+      key={idx} 
+      plank={plank}
+      maxSheetDimension={maxSheetWidth} // <--- Pass the prop here
+      onPartClick={(cut) => console.log(cut)}
+    />
+  ))}{}
+</div>
               </div>
             )}
           </div>

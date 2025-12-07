@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "wininet.lib")
@@ -15,6 +16,7 @@
 #define WINDOW_WIDTH 1400
 #define WINDOW_HEIGHT 900
 #define MAX_RESTOS 1000
+
 /* Layout */
 #define TAB_HEIGHT 44
 #define PAGE_MARGIN 10
@@ -67,6 +69,13 @@
 #define TIMER_AUTOREFRESH 1
 #define AUTOREFRESH_INTERVAL 30000
 
+/* Visualization Colors */
+#define COL_BOARD   RGB(255, 255, 225)
+#define COL_GRID    RGB(220, 220, 220) 
+#define COL_PART    RGB(173, 216, 230) 
+#define COL_OUTLINE RGB(0, 0, 128)      
+#define COL_WASTE   RGB(200, 200, 200)
+
 /* Globals */
 HINSTANCE g_hInstance;
 HWND g_hMainWindow, g_hTab, g_hStatusBar;
@@ -105,6 +114,77 @@ typedef struct {
 
 Resto g_inventory[MAX_RESTOS];
 int g_inventoryCount = 0;
+
+typedef struct {
+    int x, y, width_mm, height_mm;
+    char material[64];
+} Cut;
+
+typedef struct {
+    int id, width_mm, height_mm;
+    int cut_count;
+    Cut cuts[100]; 
+} Plank;
+
+
+int DrawBoard(HDC hdc, int xPos, int yPos, int availableWidth, Plank *plank) {
+    if (plank->width_mm <= 0) return 0;
+
+
+    float scale = ((float)availableWidth / (float)plank->width_mm) * 0.5f;
+    
+    int drawW = (int)(plank->width_mm * scale);
+    int drawH = (int)(plank->height_mm * scale);
+
+    RECT boardRect = {xPos, yPos, xPos + drawW, yPos + drawH};
+    
+    HBRUSH hWasteBrush = CreateSolidBrush(COL_BOARD);
+    FillRect(hdc, &boardRect, hWasteBrush);
+    DeleteObject(hWasteBrush);
+    FrameRect(hdc, &boardRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    HPEN hGridPen = CreatePen(PS_DOT, 1, COL_GRID);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hGridPen);
+    
+    for (int gx = 100; gx < plank->width_mm; gx += 100) {
+        int px = xPos + (int)(gx * scale);
+        MoveToEx(hdc, px, yPos, NULL);
+        LineTo(hdc, px, yPos + drawH);
+    }
+    for (int gy = 100; gy < plank->height_mm; gy += 100) {
+        int py = yPos + (int)(gy * scale);
+        MoveToEx(hdc, xPos, py, NULL);
+        LineTo(hdc, xPos + drawW, py);
+    }
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hGridPen);
+
+    HBRUSH hPartBrush = CreateSolidBrush(COL_PART);
+    
+    for (int i = 0; i < plank->cut_count; i++) {
+        Cut *c = &plank->cuts[i];
+        
+        RECT cutRect;
+        cutRect.left = xPos + (int)(c->x * scale);
+        cutRect.top = yPos + (int)(c->y * scale);
+        cutRect.right = cutRect.left + (int)(c->width_mm * scale);
+        cutRect.bottom = cutRect.top + (int)(c->height_mm * scale);
+        
+        FillRect(hdc, &cutRect, hPartBrush);
+        FrameRect(hdc, &cutRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+        if ((cutRect.right - cutRect.left) > 40 && (cutRect.bottom - cutRect.top) > 15) {
+            char buf[32];
+            wsprintfA(buf, "%dx%d", c->width_mm, c->height_mm);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COL_OUTLINE);
+            DrawTextA(hdc, buf, -1, &cutRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    
+    DeleteObject(hPartBrush);
+    return drawH;
+}
 
 int GetJsonInt(const char* json, const char* key) {
     if (!json || !key) return 0;
@@ -257,7 +337,6 @@ void ParseRestoList(const char* json) {
     while (*p && g_inventoryCount < MAX_RESTOS) {
         p = strstr(p, "{\"id\":"); if (!p) break;
         
-        // Find the end of this record by counting braces
         int braceCount = 0;
         const char* recordStart = p;
         const char* scan = p;
@@ -271,7 +350,6 @@ void ParseRestoList(const char* json) {
         }
         const char* recordEnd = scan + 1;
         
-        // Copy this record to a temp buffer for safe parsing
         int recordLen = (int)(recordEnd - recordStart);
         if (recordLen > 0 && recordLen < 2048) {
             char record[2048];
@@ -496,7 +574,6 @@ static void ConfirmCuttingPlan(void) {
     
     p += 15;
     
-    // Buffer to hold the JSON list of IDs: {"ids":[1,2,3]}
     char jsonBatch[4096];
     strcpy(jsonBatch, "{\"ids\":[");
     int count = 0;
@@ -510,7 +587,6 @@ static void ConfirmCuttingPlan(void) {
         const char* plankEnd = GetJsonObjectEnd(plankStart);
         if (!plankEnd) break;
         
-        // Robust ID extraction
         int restoId = 0;
         const char* keyPos = strstr(plankStart, "\"resto_id\"");
         if (keyPos && keyPos < plankEnd) {
@@ -587,122 +663,9 @@ static void DoCutOptimization(void) {
         return;
     }
     
-    char result[16384] = {0};
-    strcpy(result, "=== PLANO DE CORTE ===\r\n\r\n");
+    strncpy(g_optimizeResult, resp, sizeof(g_optimizeResult) - 1);
+    free(resp);
     
-    int totalPlaced = 0, totalRequested = 0;
-    const char* placed = strstr(resp, "\"total_cuts_placed\":");
-    if (placed) {
-        sscanf(placed + 20, "%d", &totalPlaced);
-    }
-    const char* requested = strstr(resp, "\"total_cuts_requested\":");
-    if (requested) {
-        sscanf(requested + 23, "%d", &totalRequested);
-    }
-    
-    const char* p = strstr(resp, "\"used_planks\":[");
-    if (p) {
-        p += 15;
-        int plankNum = 1;
-        while (*p && *p != ']') {
-            const char* plankStart = strstr(p, "{\"resto_id\":");
-            if (!plankStart) break;
-            
-            int restoId = 0, width = 0, height = 0;
-            sscanf(plankStart, "{\"resto_id\":%d", &restoId);
-            const char* ww = strstr(plankStart, "\"width_mm\":");
-            if (ww) sscanf(ww, "\"width_mm\":%d", &width);
-            const char* hh = strstr(plankStart, "\"height_mm\":");
-            if (hh) sscanf(hh, "\"height_mm\":%d", &height);
-            
-            char plankInfo[256];
-            wsprintfA(plankInfo, "PRANCHA #%d (ID:%d, %dx%dmm)\r\n", plankNum++, restoId, width, height);
-            strcat(result, plankInfo);
-            
-            const char* cuts = strstr(plankStart, "\"cuts\":[");
-            if (cuts) {
-                cuts += 8;
-                int cutNum = 1;
-                while (*cuts && *cuts != ']') {
-                    const char* cutStart = strstr(cuts, "{\"original_index\":");
-                    if (!cutStart || cutStart > strstr(cuts, "]}")) break;
-                    
-                    int cx = 0, cy = 0, cw = 0, ch = 0;
-                    sscanf(cutStart, "{\"original_index\":%*d,\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d", &cx, &cy, &cw, &ch);
-                    
-                    char cutInfo[128];
-                    wsprintfA(cutInfo, "  Peca #%d: %dx%dmm em pos (%d,%d)\r\n", cutNum++, cw, ch, cx, cy);
-                    strcat(result, cutInfo);
-                    
-                    cuts = strchr(cutStart + 1, '{');
-                    if (!cuts) break;
-                }
-            }
-            
-            strcat(result, "\r\n");
-            p = strchr(plankStart + 1, '{');
-            if (!p) break;
-        }
-    }
-    
-    const char* eff = strstr(resp, "\"efficiency_percent\":");
-    if (eff) {
-        float effVal = 0;
-        sscanf(eff, "\"efficiency_percent\":%f", &effVal);
-        char effStr[128];
-        wsprintfA(effStr, "\r\nEficiencia total: %.1f%%\r\n", effVal);
-        strcat(result, effStr);
-        wsprintfA(effStr, "Pecas colocadas: %d de %d\r\n", totalPlaced, totalRequested);
-        strcat(result, effStr);
-    }
-    
-    const char* unplaced = strstr(resp, "\"unplaced_cuts\":[");
-    if (unplaced && strstr(unplaced, "\"unplaced_cuts\":[]") != unplaced) {
-        strcat(result, "\r\n=== PECAS NAO COLOCADAS ===\r\n");
-        unplaced += 17;
-        int unplacedNum = 1;
-        while (*unplaced && *unplaced != ']') {
-            const char* cutStart = strstr(unplaced, "\"width_mm\":");
-            if (!cutStart) break;
-            
-            int w = 0, h = 0, t = 0;
-            sscanf(cutStart, "\"width_mm\":%d", &w);
-            const char* hh = strstr(cutStart, "\"height_mm\":");
-            if (hh) sscanf(hh, "\"height_mm\":%d", &h);
-            const char* tt = strstr(cutStart, "\"thickness_mm\":");
-            if (tt) sscanf(tt, "\"thickness_mm\":%d", &t);
-            
-            char mat[64] = "";
-            const char* mm = strstr(cutStart, "\"material\":\"");
-            if (mm) {
-                mm += 12;
-                const char* end = strchr(mm, '"');
-                if (end) {
-                    int len = (int)(end - mm);
-                    if (len > 63) len = 63;
-                    memcpy(mat, mm, len);
-                    mat[len] = '\0';
-                }
-            }
-            
-            char unplacedInfo[128];
-            wsprintfA(unplacedInfo, "  %d. %dx%dx%dmm %s\r\n", unplacedNum++, w, h, t, mat);
-            strcat(result, unplacedInfo);
-            
-            unplaced = strchr(cutStart + 1, '{');
-            if (!unplaced) break;
-        }
-    }
-    
-    if (totalPlaced == 0 && totalRequested > 0) {
-        strcat(result, "\r\nAVISO: Nenhuma peca foi colocada!\r\n");
-        strcat(result, "Verifique se ha retalhos disponiveis no inventario.\r\n");
-    }
-    
-    if (resp) {
-        strncpy(g_optimizeResult, resp, sizeof(g_optimizeResult) - 1);
-        free(resp);
-    }
     InvalidateRect(g_hCanvasResult, NULL, TRUE);
 }
 
@@ -937,15 +900,19 @@ static LRESULT CALLBACK AddWndProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM l
 }
 
 static void ShowAddDialog(HWND owner){
-    WNDCLASSEXA wc; 
-    ZeroMemory(&wc, sizeof(wc)); 
-    wc.cbSize = sizeof(wc); 
-    wc.lpfnWndProc = AddWndProc; 
-    wc.hInstance = g_hInstance; 
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW); 
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); 
-    wc.lpszClassName = "AddDialogClass";
-    RegisterClassExA(&wc);
+    static BOOL classRegistered = FALSE;
+    if (!classRegistered) {
+        WNDCLASSEXA wc; 
+        ZeroMemory(&wc, sizeof(wc)); 
+        wc.cbSize = sizeof(wc); 
+        wc.lpfnWndProc = AddWndProc; 
+        wc.hInstance = g_hInstance; 
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW); 
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); 
+        wc.lpszClassName = "AddDialogClass";
+        RegisterClassExA(&wc);
+        classRegistered = TRUE;
+    }
     
     HWND dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "AddDialogClass", "Adicionar Resto", WS_POPUP|WS_CAPTION|WS_SYSMENU,
         CW_USEDEFAULT,CW_USEDEFAULT,280,190, owner, NULL, g_hInstance, NULL);
@@ -1043,15 +1010,19 @@ static LRESULT CALLBACK EditWndProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM 
 }
 
 static void ShowEditDialog(HWND owner, int restoId){
-    WNDCLASSEXA wc; 
-    ZeroMemory(&wc, sizeof(wc)); 
-    wc.cbSize = sizeof(wc); 
-    wc.lpfnWndProc = EditWndProc; 
-    wc.hInstance = g_hInstance; 
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW); 
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); 
-    wc.lpszClassName = "EditDialogClass";
-    RegisterClassExA(&wc);
+    static BOOL classRegistered = FALSE;
+    if (!classRegistered) {
+        WNDCLASSEXA wc; 
+        ZeroMemory(&wc, sizeof(wc)); 
+        wc.cbSize = sizeof(wc); 
+        wc.lpfnWndProc = EditWndProc; 
+        wc.hInstance = g_hInstance; 
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW); 
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); 
+        wc.lpszClassName = "EditDialogClass";
+        RegisterClassExA(&wc);
+        classRegistered = TRUE;
+    }
     
     HWND dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "EditDialogClass", "Editar Resto", WS_POPUP|WS_CAPTION|WS_SYSMENU,
         CW_USEDEFAULT,CW_USEDEFAULT,280,190, owner, NULL, g_hInstance, (LPVOID)restoId);
@@ -1198,140 +1169,88 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             
             FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW+1));
             
-            // Check if we have valid JSON
             if (g_optimizeResult[0] == '{') {
-                
-                // 1. Parse Header Info
                 int totalPlaced = GetJsonInt(g_optimizeResult, "\"total_cuts_placed\"");
                 int totalRequested = GetJsonInt(g_optimizeResult, "\"total_cuts_requested\"");
                 float efficiency = GetJsonFloat(g_optimizeResult, "\"efficiency_percent\"");
                 
                 char header[256];
-                // Manual float formatting for C (e.g. 76.2%)
                 wsprintfA(header, "Eficiencia: %d.%d%%  |  Pecas: %d de %d", 
                           (int)efficiency, (int)((efficiency - (int)efficiency)*10), 
                           totalPlaced, totalRequested);
                 
-                // Draw Header
                 RECT headerRc = {0, 0, rc.right, 30};
                 FillRect(hdc, &headerRc, (HBRUSH)(COLOR_BTNFACE+1));
                 SetBkMode(hdc, TRANSPARENT);
                 DrawText(hdc, header, -1, &headerRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 
-                int yOffset = 35 - g_canvasScrollPos;
-                int totalHeight = 35;
+                int yOffset = 40 - g_canvasScrollPos; 
+                int totalHeight = 40;
+                int availableWidth = rc.right - 40; 
+                if (availableWidth < 100) availableWidth = 100;
 
-                // 2. Parse Used Planks
                 const char* p = strstr(g_optimizeResult, "\"used_planks\":[");
                 if (p) {
-                    p += 15; // Skip key
+                    p += 15; 
                     int plankNum = 1;
                     int safeGuard = 0; 
 
                     while (*p && *p != ']' && safeGuard < 500) {
                         safeGuard++;
-                        
-                        // Find start of plank object
                         const char* plankStart = strchr(p, '{');
                         if (!plankStart) break;
                         
-                        // Find end of plank object using the BRACE COUNTING fix
                         const char* plankEnd = GetJsonObjectEnd(plankStart);
                         if (!plankEnd) break;
 
-                        // Parse Plank Data
-                        int restoId = GetJsonInt(plankStart, "\"resto_id\"");
-                        int width = GetJsonInt(plankStart, "\"width_mm\"");
-                        int height = GetJsonInt(plankStart, "\"height_mm\"");
+                        Plank currentPlank;
+                        ZeroMemory(&currentPlank, sizeof(Plank));
+                        
+                        currentPlank.id = GetJsonInt(plankStart, "\"resto_id\"");
+                        currentPlank.width_mm = GetJsonInt(plankStart, "\"width_mm\"");
+                        currentPlank.height_mm = GetJsonInt(plankStart, "\"height_mm\"");
 
-                        // Draw Plank Title
-                        char plankInfo[128];
-                        wsprintfA(plankInfo, "Prancha #%d (ID:%d) - %dx%dmm", plankNum++, restoId, width, height);
-                        
-                        SetTextColor(hdc, RGB(0,0,0));
-                        TextOut(hdc, 10, yOffset, plankInfo, strlen(plankInfo));
-                        yOffset += 20;
-
-                        // Calculate Scale
-                        float scale = 0.3f;
-                        if (width > 0) {
-                            int maxW = rc.right - 40;
-                            if (maxW < 100) maxW = 100;
-                            float scaleW = (float)maxW / width;
-                            if (scaleW < scale) scale = scaleW;
-                        }
-                        
-                        int drawW = (int)(width * scale);
-                        int drawH = (int)(height * scale);
-                        
-                        RECT plankRc = {20, yOffset, 20 + drawW, yOffset + drawH};
-                        
-                        // Draw Plank Rect
-                        HBRUSH hBrPlank = CreateSolidBrush(RGB(220, 220, 220));
-                        FillRect(hdc, &plankRc, hBrPlank);
-                        DeleteObject(hBrPlank);
-                        FrameRect(hdc, &plankRc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-                        // 3. Draw Cuts inside this plank
-                        // Limit the search for "cuts" strictly to the range of [plankStart, plankEnd]
                         const char* cuts = strstr(plankStart, "\"cuts\":[");
                         if (cuts && cuts < plankEnd) {
                             const char* c = cuts;
                             const char* cutsEnd = strchr(cuts, ']');
-                            // Ensure we don't overshoot the plank end
-                            if (cutsEnd > plankEnd) cutsEnd = plankEnd;
                             
-                            HBRUSH hBrCut = CreateSolidBrush(RGB(100, 150, 255));
-                            
-                            while (c && c < cutsEnd) {
+                            while (c && c < cutsEnd && currentPlank.cut_count < 100) {
                                 const char* cutStart = strchr(c, '{');
                                 if (!cutStart || cutStart > cutsEnd) break;
                                 
                                 const char* cutEnd = GetJsonObjectEnd(cutStart);
                                 if (!cutEnd) break;
                                 
-                                int cx = GetJsonInt(cutStart, "\"x\"");
-                                int cy = GetJsonInt(cutStart, "\"y\"");
-                                int cw = GetJsonInt(cutStart, "\"width\"");
-                                int ch = GetJsonInt(cutStart, "\"height\"");
+                                Cut *newCut = &currentPlank.cuts[currentPlank.cut_count];
+                                newCut->x = GetJsonInt(cutStart, "\"x\"");
+                                newCut->y = GetJsonInt(cutStart, "\"y\"");
+                                newCut->width_mm = GetJsonInt(cutStart, "\"width\"");
+                                newCut->height_mm = GetJsonInt(cutStart, "\"height\"");
                                 
-                                if (cw > 0 && ch > 0) {
-                                    RECT cutRc;
-                                    cutRc.left = plankRc.left + (int)(cx * scale);
-                                    cutRc.top = plankRc.top + (int)(cy * scale);
-                                    cutRc.right = cutRc.left + (int)(cw * scale);
-                                    cutRc.bottom = cutRc.top + (int)(ch * scale);
-                                    
-                                    FillRect(hdc, &cutRc, hBrCut);
-                                    FrameRect(hdc, &cutRc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-                                    int pxWidth = cutRc.right - cutRc.left;
-                                    int pxHeight = cutRc.bottom - cutRc.top;
-                                    
-                                    // Draw Dimensions
-                                    if (cw >= 30 && ch >= 15 && pxWidth > 25 && pxHeight > 10) {
-                                        char dimStr[32];
-                                        wsprintfA(dimStr, "%dx%d", cw, ch);
-                                        SetBkMode(hdc, TRANSPARENT);
-                                        DrawText(hdc, dimStr, -1, &cutRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                                    }
-                                }
+                                currentPlank.cut_count++;
                                 c = cutEnd + 1;
                             }
-                            DeleteObject(hBrCut);
                         }
 
-                        yOffset += drawH + 30;
-                        p = plankEnd + 1; // Move loop to after the current plank
+                        char plankInfo[128];
+                        wsprintfA(plankInfo, "Prancha #%d (ID:%d) - %dx%dmm", plankNum++, currentPlank.id, currentPlank.width_mm, currentPlank.height_mm);
+                        SetTextColor(hdc, RGB(0,0,0));
+                        TextOut(hdc, 20, yOffset, plankInfo, strlen(plankInfo));
+                        yOffset += 20;
+
+                        int drawnHeight = DrawBoard(hdc, 20, yOffset, availableWidth, &currentPlank);
+                        
+                        yOffset += drawnHeight + 40;
+                        p = plankEnd + 1;
                     }
                 }
                 
                 totalHeight = yOffset + g_canvasScrollPos;
-                
-                // Update Scrollbar
                 if (totalHeight != g_canvasTotalHeight) {
                     g_canvasTotalHeight = totalHeight;
                     SCROLLINFO si;
+                    ZeroMemory(&si, sizeof(si));
                     si.cbSize = sizeof(si);
                     si.fMask = SIF_RANGE | SIF_PAGE;
                     si.nMin = 0;

@@ -9,9 +9,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, Pool, Sqlite};
 use std::fs;
-use std::io::Write; // Needed for Python input
+use std::io::Write;
 use std::net::SocketAddr;
-use std::process::Command; // Needed to call Python
+use std::process::Command;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tower::ServiceBuilder;
@@ -24,7 +24,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod cutting_optimizer;
 use cutting_optimizer::optimize_cuts;
 
-// Constants
 const MIN_DIMENSION: i64 = 1;
 const MAX_DIMENSION: i64 = 10000;
 const MAX_THICKNESS: i64 = 1000;
@@ -50,7 +49,7 @@ enum AppError {
     Validation(String),
     NotFound(String),
     Database(sqlx::Error),
-    Internal(String), // Added for Python errors
+    Internal(String),
 }
 
 impl IntoResponse for AppError {
@@ -90,8 +89,6 @@ impl IntoResponse for AppError {
         (status, body).into_response()
     }
 }
-
-// ===== VALIDATION UTILS =====
 
 fn validate_dimensions(width: i64, height: i64, thickness: i64) -> Result<(), AppError> {
     if width < MIN_DIMENSION || width > MAX_DIMENSION {
@@ -187,8 +184,6 @@ async fn auth_middleware(
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
-
-// ===== DATA MODELS =====
 
 #[derive(Serialize, FromRow, Clone)]
 struct Leftover {
@@ -370,8 +365,6 @@ struct SearchQuery {
     material: String,
 }
 
-// ===== MAIN SERVER SETUP =====
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -394,7 +387,6 @@ async fn main() -> anyhow::Result<()> {
         .connect(&connection_string)
         .await?;
 
-    // DB Config
     sqlx::query("PRAGMA journal_mode=WAL;").execute(&db).await?;
     sqlx::query("PRAGMA foreign_keys=ON;").execute(&db).await?;
     sqlx::query("PRAGMA busy_timeout=5000;")
@@ -442,9 +434,7 @@ async fn main() -> anyhow::Result<()> {
             "/vans/:id",
             get(get_van).post(update_van).delete(delete_van),
         )
-        // The Loading Optimization (now calls Python)
         .route("/optimize", post(optimize_loading))
-        // The Cutting Optimization (Kept from original)
         .route("/optimize_cuts", post(optimize_cuts))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -462,7 +452,7 @@ async fn main() -> anyhow::Result<()> {
                                 .latency_unit(LatencyUnit::Millis),
                         ),
                 )
-                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                .layer(TimeoutLayer::new(Duration::from_secs(120)))
                 .layer(
                     CorsLayer::new()
                         .allow_origin(Any)
@@ -477,8 +467,6 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-// ===== RESTO HANDLERS (Unchanged) =====
 
 async fn add_resto(
     State(state): State<AppState>,
@@ -624,8 +612,6 @@ async fn get_stats(State(state): State<AppState>) -> Result<impl IntoResponse, A
     }))
 }
 
-// ===== VAN HANDLERS (Unchanged) =====
-
 async fn list_vans(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let vans =
         sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE active = 1 ORDER BY created_at DESC")
@@ -703,15 +689,12 @@ async fn delete_van(
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
-// ===== OPTIMIZATION (OFFLOADED TO PYTHON) =====
-
 async fn optimize_loading(
     State(state): State<AppState>,
     Json(req): Json<OptimizeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!(van_id = %req.van_id, items = %req.items.len(), "Optimizing load via Python Sidecar");
 
-    // 1. Fetch Van Details
     let van = sqlx::query_as::<_, Van>("SELECT * FROM vans WHERE id = ? AND active = 1")
         .bind(req.van_id)
         .fetch_optional(&state.db)
@@ -719,24 +702,16 @@ async fn optimize_loading(
         .map_err(AppError::Database)?
         .ok_or_else(|| AppError::NotFound(format!("Van {} not found or inactive", req.van_id)))?;
 
-    // 2. Prepare Payload
-    // Wrap vanilla request data into a structure Python expects
     let input_data = serde_json::json!({
         "van": van,
         "items": req.items
     });
 
-    // Serialize to string to pass via STDIN
     let input_str = serde_json::to_string(&input_data)
         .map_err(|e| AppError::Internal(format!("JSON serialization error: {}", e)))?;
 
-    // 3. Call Python Script (Blocking Task)
-    // We use spawn_blocking because executing a shell command is a synchronous, potentially slow operation
     let python_result = tokio::task::spawn_blocking(move || {
-        // NOTE: Ensure 'python3' (or 'python') is in your PATH.
-        // Also ensure 'optimizer.py' is in the working directory (RustServer root).
         let (cmd, args) = if cfg!(target_os = "windows") {
-            // Tenta usar "py" com argumento "-3.12" para garantir a versão compatível
             ("py", vec!["-3.12", "optimizer.py"])
         } else {
             ("python3", vec!["optimizer.py"])
@@ -749,14 +724,12 @@ async fn optimize_loading(
             .spawn()
             .map_err(|e| format!("Failed to spawn python process: {}", e))?;
 
-        // Write input to the python script's stdin
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(input_str.as_bytes())
                 .map_err(|e| format!("Failed to write to python stdin: {}", e))?;
         }
 
-        // Wait for output
         let output = child
             .wait_with_output()
             .map_err(|e| format!("Failed to read python output: {}", e))?;
@@ -771,10 +744,8 @@ async fn optimize_loading(
     .await
     .map_err(|e| AppError::Internal(format!("Task spawn error: {}", e)))?;
 
-    // 4. Handle Result
     let output_bytes = python_result.map_err(AppError::Internal)?;
 
-    // Python script is expected to return the exact structure of OptimizeResponse JSON
     let response: OptimizeResponse = serde_json::from_slice(&output_bytes).map_err(|e| {
         AppError::Internal(format!(
             "Failed to parse Python response: {}. Output was: {:?}",
@@ -785,8 +756,6 @@ async fn optimize_loading(
 
     Ok(Json(response))
 }
-
-// ===== SYSTEM HANDLERS =====
 
 #[derive(Serialize)]
 struct HealthResponse {

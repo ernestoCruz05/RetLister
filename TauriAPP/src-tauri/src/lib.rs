@@ -9,7 +9,7 @@ fn greet(name: &str) -> String {
 #[tauri::command]
 async fn check_api_status(url: String) -> bool {
     let client = reqwest::Client::new();
-    let token = "ambrito-carpintaria-1234";
+    let token = "ambrito-carpintaria-123";
     
     let target_url = if url.ends_with("/health") {
         url
@@ -33,7 +33,7 @@ async fn check_api_status(url: String) -> bool {
 #[tauri::command]
 async fn authenticated_request(method: String, url: String, body: Option<String>) -> Result<String, String> {
     let client = reqwest::Client::new();
-    let token = "ambrito-carpintaria-1234"; // In production, maybe load this from config
+    let token = "ambrito-carpintaria-123";
 
     let mut request = match method.as_str() {
         "POST" => client.post(&url),

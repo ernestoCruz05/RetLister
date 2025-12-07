@@ -12,8 +12,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use tower_http::cors::{Any, CorsLayer};
 
-// ===== DATA STRUCTURES =====
-
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Resto {
     id: i64,
@@ -42,7 +40,6 @@ struct SearchRestoRequest {
     material: String,
 }
 
-// New struct for batch deletion
 #[derive(Debug, Serialize, Deserialize)]
 struct DeleteBatchRequest {
     ids: Vec<i64>,
@@ -172,10 +169,9 @@ async fn add_resto(
 ) -> Result<Json<Resto>, StatusCode> {
     let client = reqwest::Client::new();
 
-    // Try Main Server
     if let Ok(response) = client
         .post(&format!("{}/add", state.main_server_url))
-        .bearer_auth(&state.auth_token) // <--- AUTH
+        .bearer_auth(&state.auth_token)
         .header(reqwest::header::USER_AGENT, "RetListerProxy/1.0")
         .json(&payload)
         .send()
@@ -216,7 +212,7 @@ async fn remove_resto(
 
     if client
         .delete(&format!("{}/remove/{}", state.main_server_url, id))
-        .bearer_auth(&state.auth_token) // <--- AUTH
+        .bearer_auth(&state.auth_token)
         .header(reqwest::header::USER_AGENT, "RetListerProxy/1.0")
         .send()
         .await
@@ -319,7 +315,7 @@ async fn proxy_optimize_cuts(
     let client = reqwest::Client::new();
     let response = client
         .post(&format!("{}/optimize_cuts", state.main_server_url))
-        .bearer_auth(&state.auth_token) // <--- AUTH
+        .bearer_auth(&state.auth_token)
         .header(reqwest::header::USER_AGENT, "RetListerProxy/1.0")
         .json(&payload)
         .send()
@@ -435,7 +431,7 @@ async fn init_db() -> Result<SqlitePool, sqlx::Error> {
 }
 
 async fn sync_loop(state: Arc<AppState>) {
-    let mut ticker = interval(Duration::from_secs(30)); // Check every 30 seconds
+    let mut ticker = interval(Duration::from_secs(30));
 
     loop {
         ticker.tick().await;
@@ -518,7 +514,6 @@ async fn sync_loop(state: Arc<AppState>) {
         .execute(&state.db)
         .await;
 
-        // Clean up old synced items (keep last 1000)
         let _ = sqlx::query(
             "DELETE FROM sync_queue WHERE synced = 1 AND id NOT IN (
                 SELECT id FROM sync_queue WHERE synced = 1 ORDER BY timestamp DESC LIMIT 1000
@@ -620,7 +615,7 @@ async fn main() {
     let db = init_db().await.expect("Failed to initialize database");
 
     let auth_token =
-        std::env::var("AUTH_TOKEN").unwrap_or_else(|_| "ambrito-carpintaria-1234".to_string());
+        std::env::var("AUTH_TOKEN").unwrap_or_else(|_| "ambrito-carpintaria-123".to_string());
 
     let state = Arc::new(AppState {
         db,
@@ -629,7 +624,6 @@ async fn main() {
         start_time: std::time::Instant::now(),
     });
 
-    // Spawn background sync loop
     let sync_state = Arc::clone(&state);
     tokio::spawn(async move {
         sync_loop(sync_state).await;

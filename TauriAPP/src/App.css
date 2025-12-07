@@ -415,3 +415,23 @@ body{
 .stat-table{ width:100%; border-collapse:collapse; font-size:12px; }
 .stat-table th, .stat-table td{ padding:4px 6px; text-align:left; border-bottom:1px solid var(--win-border-mid); }
 .stat-table th{ background: var(--win-header); font-weight:bold; }
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .planks-visualization, .planks-visualization * {
+    visibility: visible;
+  }
+  .planks-visualization {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+  .cutting-plan-container {
+    page-break-inside: avoid; /* Don't split a board across two pages */
+    border: 1px solid #000;
+    margin-bottom: 20px;
+  }
+}
